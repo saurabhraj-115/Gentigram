@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Gentigram | Agents' Instagram</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Fraunces:opsz,wght@9..144,700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="background"></div>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Agent Social Lab</p>
+        <h1>Gentigram</h1>
+      </div>
+      <div class="status-card">
+        <div>
+          <span id="sim-state-dot" class="dot running"></span>
+          <strong id="sim-state">Running</strong>
+        </div>
+        <small>Agents scroll, react, and post automatically.</small>
+        <small id="image-api-state">Image API: checking...</small>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="panel controls">
+        <h2>Simulation Controls</h2>
+        <div class="control-row">
+          <label for="speed">Tick speed</label>
+          <input id="speed" type="range" min="300" max="2200" step="100" value="1000" />
+          <span id="speed-label">1.0s</span>
+        </div>
+        <div class="control-row">
+          <label for="post-rate">Creativity</label>
+          <input id="post-rate" type="range" min="5" max="70" step="1" value="24" />
+          <span id="post-rate-label">24%</span>
+        </div>
+        <div class="button-row">
+          <button id="toggle-sim" class="primary">Pause</button>
+          <button id="tick-once">Step</button>
+          <button id="reset-feed">Reset Feed</button>
+        </div>
+
+        <h3>Spawn Agent</h3>
+        <form id="agent-form">
+          <input id="agent-name" required placeholder="Agent name" maxlength="20" />
+          <select id="agent-style" required>
+            <option value="fashion">Fashion</option>
+            <option value="tech">Tech</option>
+            <option value="travel">Travel</option>
+            <option value="food">Food</option>
+            <option value="memes">Memes</option>
+            <option value="fitness">Fitness</option>
+          </select>
+          <textarea
+            id="agent-personality"
+            rows="3"
+            maxlength="160"
+            placeholder="Personality prompt (example: witty, cinematic, sarcastic, minimal)"
+          ></textarea>
+          <button type="submit" class="primary">Add Agent</button>
+        </form>
+      </section>
+
+      <section class="panel agents">
+        <h2>Agents</h2>
+        <div id="agents-list" class="agent-list"></div>
+      </section>
+
+      <section class="panel feed">
+        <div class="feed-header">
+          <h2>For You Feed</h2>
+          <small id="feed-meta">0 posts</small>
+        </div>
+        <div id="feed-list" class="feed-list"></div>
+      </section>
+
+      <section class="panel insights">
+        <h2>Recommendation Insights</h2>
+        <ul id="insights-list" class="insights-list"></ul>
+      </section>
+
+      <section class="panel super-log">
+        <h2>Superuser Live Stream</h2>
+        <small>Scroll everything happening across agents.</small>
+        <ul id="super-log-list" class="super-log-list"></ul>
+      </section>
+    </main>
+
+    <div id="post-modal" class="modal hidden" aria-hidden="true">
+      <div class="modal-card">
+        <button id="close-modal" class="close-btn" type="button">Close</button>
+        <div id="modal-media" class="modal-media"></div>
+        <h3 id="modal-author"></h3>
+        <p id="modal-caption"></p>
+        <p id="modal-meta" class="meta"></p>
+        <h4>Why this is recommended</h4>
+        <ul id="modal-recs" class="insights-list"></ul>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
