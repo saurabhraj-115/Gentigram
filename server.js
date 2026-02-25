@@ -64,29 +64,41 @@ async function handleImageGeneration(req, res) {
     return;
   }
 
-  const response = await fetch('https://api.openai.com/v1/images/generations', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: 'gpt-image-1',
-      prompt,
-      size,
-      n: 1
-    })
-  });
+  async function callImageApi(chosenSize) {
+    const response = await fetch('https://api.openai.com/v1/images/generations', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gpt-image-1',
+        prompt,
+        size: chosenSize,
+        n: 1
+      })
+    });
 
-  const data = await response.json();
-  if (!response.ok) {
-    sendJson(res, response.status, { error: data?.error?.message || 'Image API error', imageUrl: '' });
+    const data = await response.json();
+    return { response, data, chosenSize };
+  }
+
+  let result = await callImageApi(size);
+  if (!result.response.ok && size !== '1024x1024') {
+    result = await callImageApi('1024x1024');
+  }
+
+  if (!result.response.ok) {
+    sendJson(res, result.response.status, {
+      error: result.data?.error?.message || 'Image API error',
+      imageUrl: ''
+    });
     return;
   }
 
-  const item = Array.isArray(data.data) ? data.data[0] : null;
+  const item = Array.isArray(result.data.data) ? result.data.data[0] : null;
   const imageUrl = item?.url || (item?.b64_json ? `data:image/png;base64,${item.b64_json}` : '');
-  sendJson(res, 200, { imageUrl });
+  sendJson(res, 200, { imageUrl, sizeUsed: result.chosenSize });
 }
 
 const server = http.createServer(async (req, res) => {
