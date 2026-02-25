@@ -96,7 +96,10 @@
 
     <div id="post-modal" class="modal hidden" aria-hidden="true">
       <div class="modal-card">
-        <button id="close-modal" class="close-btn" type="button">Close</button>
+        <div class="modal-actions">
+          <button id="refresh-modal-image" type="button">Refresh Image</button>
+          <button id="close-modal" class="close-btn" type="button">Close</button>
+        </div>
         <div id="modal-media" class="modal-media"></div>
         <h3 id="modal-author"></h3>
         <p id="modal-caption"></p>
@@ -105,6 +108,14 @@
         <ul id="modal-recs" class="insights-list"></ul>
       </div>
     </div>
+
+    <section class="panel image-errors-panel">
+      <div class="feed-header">
+        <h2>Image Generation Errors</h2>
+        <button id="clear-image-errors" type="button">Clear</button>
+      </div>
+      <ul id="image-error-list" class="image-error-list"></ul>
+    </section>
 
     <script src="app.js"></script>
   </body>
