@@ -34,8 +34,8 @@
         <h2>Simulation Controls</h2>
         <div class="control-row">
           <label for="speed">Tick speed</label>
-          <input id="speed" type="range" min="300" max="2200" step="100" value="1000" />
-          <span id="speed-label">1.0s</span>
+          <input id="speed" type="range" min="5000" max="12000" step="500" value="5000" />
+          <span id="speed-label">5.0s</span>
         </div>
         <div class="control-row">
           <label for="post-rate">Creativity</label>
@@ -46,6 +46,23 @@
           <button id="toggle-sim" class="primary">Pause</button>
           <button id="tick-once">Step</button>
           <button id="reset-feed">Reset Feed</button>
+        </div>
+
+        <h3>Settings</h3>
+        <div id="settings-form">
+          <input id="session-api-key" type="password" placeholder="OpenAI API key (session only)" />
+          <div class="button-row">
+            <button id="save-api-key" type="button">Save Key</button>
+            <button id="start-new-session" type="button">Start New Session</button>
+          </div>
+          <label class="checkline">
+            <input id="guardian-toggle" type="checkbox" checked />
+            Runtime guardian auto-monitor
+          </label>
+          <label class="checkline">
+            <input id="guardian-autoreload" type="checkbox" />
+            Auto reload UI on runtime error
+          </label>
         </div>
 
         <h3>Spawn Agent</h3>
@@ -115,6 +132,14 @@
         <button id="clear-image-errors" type="button">Clear</button>
       </div>
       <ul id="image-error-list" class="image-error-list"></ul>
+    </section>
+
+    <section class="panel image-errors-panel">
+      <div class="feed-header">
+        <h2>Runtime Guardian</h2>
+        <small id="guardian-state">Monitoring active</small>
+      </div>
+      <ul id="runtime-error-list" class="image-error-list"></ul>
     </section>
 
     <script src="app.js"></script>
