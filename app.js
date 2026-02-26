@@ -9,10 +9,14 @@ const TOPICS = {
 
 const DB_NAME = "gentigram_db";
 const DB_VERSION = 1;
+const DECISION_INTERVAL_MS = 5000;
+const BOT_IMAGE_POST_FACTOR = 0.28;
+const IMAGE_DRAFT_COOLDOWN_TICKS = 3;
+const FORCE_FRESH_BOOT = true;
 
 const APP_STATE = {
   running: true,
-  tickMs: 1000,
+  tickMs: DECISION_INTERVAL_MS,
   creativityPercent: 24,
   tick: 0,
   nextPostSeq: 1,
@@ -29,7 +33,11 @@ const APP_STATE = {
   imageQueue: [],
   imageJobsActive: 0,
   imageJobsMax: 2,
-  lastImageError: ""
+  lastImageError: "",
+  runtimeGuardianEnabled: true,
+  runtimeGuardianAutoReload: false,
+  runtimeLogs: [],
+  runtimePollTimer: null
 };
 
 const ELS = {
@@ -51,6 +59,13 @@ const ELS = {
   superLogList: document.getElementById("super-log-list"),
   imageErrorList: document.getElementById("image-error-list"),
   clearImageErrorsBtn: document.getElementById("clear-image-errors"),
+  sessionApiKey: document.getElementById("session-api-key"),
+  saveApiKeyBtn: document.getElementById("save-api-key"),
+  startNewSessionBtn: document.getElementById("start-new-session"),
+  guardianToggle: document.getElementById("guardian-toggle"),
+  guardianAutoreload: document.getElementById("guardian-autoreload"),
+  guardianState: document.getElementById("guardian-state"),
+  runtimeErrorList: document.getElementById("runtime-error-list"),
   simState: document.getElementById("sim-state"),
   simDot: document.getElementById("sim-state-dot"),
   imageApiState: document.getElementById("image-api-state"),
@@ -137,6 +152,7 @@ function createAgent(name, style, personalityPrompt = "") {
     style,
     personalityPrompt: safePersonality(personalityPrompt),
     attention: 0,
+    lastDraftTick: -1000,
     postsCreated: 0,
     likesGiven: 0,
     seenPostIds: new Set(),
@@ -147,7 +163,7 @@ function createAgent(name, style, personalityPrompt = "") {
   };
 }
 
-function createPost(topic, author = "seed", personalityPrompt = "") {
+function createPost(topic, author = "system", personalityPrompt = "") {
   const [c1, c2] = topicGradient(topic);
   return {
     id: `post-${APP_STATE.nextPostSeq++}`,
@@ -202,6 +218,17 @@ function addImageError(message) {
   APP_STATE.lastImageError = message;
 }
 
+function addRuntimeLog(message, source = "client", suggestion = "") {
+  APP_STATE.runtimeLogs.unshift({
+    id: crypto.randomUUID(),
+    at: new Date().toISOString(),
+    source,
+    message,
+    suggestion
+  });
+  APP_STATE.runtimeLogs = APP_STATE.runtimeLogs.slice(0, 120);
+}
+
 function setupInitialState() {
   APP_STATE.feed = [];
   APP_STATE.agents = [
@@ -229,11 +256,18 @@ function seedInitialPosts() {
     return;
   }
 
-  const seeds = ["fashion", "tech", "travel", "food", "memes", "fitness"];
-  seeds.forEach((topic) => {
-    const draft = createPost(topic, "seed", "cinematic");
+  const starters = APP_STATE.agents.length
+    ? APP_STATE.agents.map((agent) => ({
+        author: agent.name,
+        topic: agent.style,
+        personalityPrompt: agent.personalityPrompt
+      }))
+    : [{ author: "system", topic: "fashion", personalityPrompt: "cinematic" }];
+
+  starters.forEach((item) => {
+    const draft = createPost(item.topic, item.author, item.personalityPrompt);
     draft.likes = 2 + Math.floor(Math.random() * 12);
-    enqueueImageGeneration(draft, "cinematic", {
+    enqueueImageGeneration(draft, item.personalityPrompt, {
       publishOnSuccess: true,
       agentId: null,
       signal: 0.72
@@ -323,7 +357,10 @@ async function persistState() {
     insights: APP_STATE.insights,
     userBrowsingFeed: APP_STATE.userBrowsingFeed,
     imageErrors: APP_STATE.imageErrors,
-    lastImageError: APP_STATE.lastImageError
+    lastImageError: APP_STATE.lastImageError,
+    runtimeGuardianEnabled: APP_STATE.runtimeGuardianEnabled,
+    runtimeGuardianAutoReload: APP_STATE.runtimeGuardianAutoReload,
+    runtimeLogs: APP_STATE.runtimeLogs
   });
 
   await transactionDone(tx);
@@ -351,6 +388,7 @@ async function loadState() {
   APP_STATE.agents = agents.map((agent) => ({
     ...agent,
     personalityPrompt: safePersonality(agent.personalityPrompt),
+    lastDraftTick: Number(agent.lastDraftTick ?? -1000),
     seenPostIds: new Set(agent.seenPostIds || [])
   }));
   APP_STATE.feed = posts.map(normalizePost);
@@ -358,12 +396,15 @@ async function loadState() {
   APP_STATE.running = Boolean(meta.running);
   APP_STATE.tick = Number(meta.tick || 0);
   APP_STATE.nextPostSeq = Number(meta.nextPostSeq || posts.length + 1);
-  APP_STATE.tickMs = Number(meta.tickMs || 1000);
+  APP_STATE.tickMs = Math.max(DECISION_INTERVAL_MS, Number(meta.tickMs || DECISION_INTERVAL_MS));
   APP_STATE.creativityPercent = Number(meta.creativityPercent || 24);
   APP_STATE.insights = Array.isArray(meta.insights) ? meta.insights : [];
   APP_STATE.userBrowsingFeed = Boolean(meta.userBrowsingFeed);
   APP_STATE.imageErrors = Array.isArray(meta.imageErrors) ? meta.imageErrors : [];
   APP_STATE.lastImageError = String(meta.lastImageError || "");
+  APP_STATE.runtimeGuardianEnabled = meta.runtimeGuardianEnabled !== false;
+  APP_STATE.runtimeGuardianAutoReload = Boolean(meta.runtimeGuardianAutoReload);
+  APP_STATE.runtimeLogs = Array.isArray(meta.runtimeLogs) ? meta.runtimeLogs : [];
 
   addActivity("State restored from browser database.");
 }
@@ -525,6 +566,101 @@ async function checkApiConfig() {
   }
 }
 
+async function saveSessionApiKey(apiKey) {
+  const response = await fetch("/api/session/openai-key", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ apiKey })
+  });
+  if (!response.ok) {
+    const payload = await response.json();
+    throw new Error(payload.error || "Failed to save API key");
+  }
+}
+
+function resetDatabaseAndReload() {
+  const db = APP_STATE.db;
+  if (db) db.close();
+  const req = indexedDB.deleteDatabase(DB_NAME);
+  req.onsuccess = () => location.reload();
+  req.onerror = () => location.reload();
+  req.onblocked = () => location.reload();
+}
+
+async function suggestRuntimeFix(errorText) {
+  if (!APP_STATE.imageApiReady) return "";
+  try {
+    const response = await fetch("/api/suggest-fix", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ error: errorText })
+    });
+    const payload = await response.json();
+    if (!response.ok) return "";
+    return String(payload.suggestion || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+async function reportRuntimeError(message, source = "client") {
+  if (!APP_STATE.runtimeGuardianEnabled) return;
+  const suggestion = await suggestRuntimeFix(message);
+  addRuntimeLog(message, source, suggestion);
+  renderRuntimeLogs();
+  persistSoon();
+  if (APP_STATE.runtimeGuardianAutoReload) {
+    setTimeout(() => location.reload(), 1200);
+  }
+}
+
+async function applySuggestedPatch(logItem) {
+  const response = await fetch("/api/apply-suggested-patch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      error: logItem.message,
+      suggestion: logItem.suggestion
+    })
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || "Patch apply failed");
+  }
+  return payload;
+}
+
+async function pollRuntimeErrors() {
+  if (!APP_STATE.runtimeGuardianEnabled) return;
+  try {
+    const response = await fetch("/api/runtime-errors");
+    if (!response.ok) return;
+    const payload = await response.json();
+    const errors = Array.isArray(payload.errors) ? payload.errors : [];
+    if (!errors.length) return;
+
+    const newest = errors[0];
+    const signature = `${newest.at}|${newest.source}|${newest.message}`;
+    const already = APP_STATE.runtimeLogs.some(
+      (item) => `${item.at}|${item.source}|${item.message}` === signature
+    );
+    if (!already) {
+      await reportRuntimeError(newest.message, newest.source || "server");
+    }
+  } catch {
+    // no-op
+  }
+}
+
+function startRuntimeGuardian() {
+  if (APP_STATE.runtimePollTimer) {
+    clearInterval(APP_STATE.runtimePollTimer);
+  }
+  APP_STATE.runtimePollTimer = setInterval(() => {
+    pollRuntimeErrors();
+  }, 5000);
+}
+
 function queueImagesForVisibleFeed() {
   if (!APP_STATE.imageApiReady) return;
 
@@ -567,7 +703,10 @@ function runTick() {
       (viewed.score > 0.7 ? 0.12 : 0) +
       Math.min(0.12, agent.attention * 0.008);
 
-    if (Math.random() < boostedChance) {
+    const cooldownReady = APP_STATE.tick - agent.lastDraftTick >= IMAGE_DRAFT_COOLDOWN_TICKS;
+    const postDecisionChance = Math.min(0.45, boostedChance * BOT_IMAGE_POST_FACTOR);
+
+    if (cooldownReady && Math.random() < postDecisionChance) {
       const preferred = Object.entries(agent.affinity)
         .sort((a, b) => b[1] - a[1])
         .slice(0, 2)
@@ -577,6 +716,7 @@ function runTick() {
       const draft = createPost(chosenTopic, agent.name, agent.personalityPrompt);
       draft.caption = `${draft.caption} #${chosenTopic} #gentigram`;
       addActivity(`${agent.name} drafted ${chosenTopic}; waiting for image generation.`, "post");
+      agent.lastDraftTick = APP_STATE.tick;
       enqueueImageGeneration(draft, agent.personalityPrompt, {
         publishOnSuccess: true,
         agentId: agent.id,
@@ -630,6 +770,7 @@ function renderPostMedia(post) {
 }
 
 function renderFeed() {
+  const previousScrollTop = ELS.feedList.scrollTop;
   const visible = APP_STATE.feed.slice(0, 70);
   ELS.feedMeta.textContent = `${APP_STATE.feed.length} posts${APP_STATE.userBrowsingFeed ? " · manual browse" : ""}`;
   ELS.feedList.innerHTML = visible
@@ -646,6 +787,7 @@ function renderFeed() {
       </article>`
     )
     .join("");
+  ELS.feedList.scrollTop = previousScrollTop;
 }
 
 function renderInsights() {
@@ -665,6 +807,24 @@ function renderImageErrors() {
     : "<li>No image generation errors.</li>";
 }
 
+function renderRuntimeLogs() {
+  ELS.runtimeErrorList.innerHTML = APP_STATE.runtimeLogs.length
+    ? APP_STATE.runtimeLogs
+        .slice(0, 80)
+        .map((item, idx) => {
+          const suggestion = item.suggestion ? `<br/><strong>Fix:</strong> ${esc(item.suggestion)}` : "";
+          const action = item.suggestion
+            ? `<div class="button-row"><button type="button" class="apply-patch-btn" data-log-index="${idx}">Apply Patch</button></div>`
+            : "";
+          return `<li>[${esc(item.source)}] ${esc(item.message)}${suggestion}${action}</li>`;
+        })
+        .join("")
+    : "<li>No runtime errors detected.</li>";
+  ELS.guardianState.textContent = APP_STATE.runtimeGuardianEnabled
+    ? "Monitoring active"
+    : "Monitoring paused";
+}
+
 function renderSimState() {
   ELS.simState.textContent = APP_STATE.running ? "Running" : "Paused";
   ELS.simDot.classList.toggle("running", APP_STATE.running);
@@ -680,6 +840,8 @@ function renderControlValues() {
   ELS.imageApiState.textContent = APP_STATE.imageApiReady
     ? `Image API: OpenAI connected${APP_STATE.lastImageError ? ` (last error: ${APP_STATE.lastImageError})` : ""}`
     : "Image API: unavailable (start server with OPENAI_API_KEY)";
+  ELS.guardianToggle.checked = APP_STATE.runtimeGuardianEnabled;
+  ELS.guardianAutoreload.checked = APP_STATE.runtimeGuardianAutoReload;
 }
 
 function render() {
@@ -688,6 +850,7 @@ function render() {
   renderInsights();
   renderSuperLog();
   renderImageErrors();
+  renderRuntimeLogs();
   renderSimState();
   renderControlValues();
 }
@@ -821,6 +984,66 @@ ELS.clearImageErrorsBtn.addEventListener("click", () => {
   persistSoon();
 });
 
+ELS.saveApiKeyBtn.addEventListener("click", async () => {
+  const key = ELS.sessionApiKey.value.trim();
+  if (!key) return;
+  try {
+    await saveSessionApiKey(key);
+    ELS.sessionApiKey.value = "";
+    await checkApiConfig();
+    addActivity("Session API key saved in server memory.", "system");
+    render();
+    queueImagesForVisibleFeed();
+    persistSoon();
+  } catch (error) {
+    addRuntimeLog(error.message || "Failed to save session key", "settings");
+    renderRuntimeLogs();
+  }
+});
+
+ELS.startNewSessionBtn.addEventListener("click", () => {
+  APP_STATE.running = false;
+  APP_STATE.imageQueue = [];
+  APP_STATE.runtimeLogs = [];
+  APP_STATE.imageErrors = [];
+  resetDatabaseAndReload();
+});
+
+ELS.guardianToggle.addEventListener("change", (event) => {
+  APP_STATE.runtimeGuardianEnabled = Boolean(event.target.checked);
+  renderRuntimeLogs();
+  persistSoon();
+});
+
+ELS.guardianAutoreload.addEventListener("change", (event) => {
+  APP_STATE.runtimeGuardianAutoReload = Boolean(event.target.checked);
+  persistSoon();
+});
+
+ELS.runtimeErrorList.addEventListener("click", async (event) => {
+  const button = event.target.closest(".apply-patch-btn");
+  if (!button) return;
+  const idx = Number(button.dataset.logIndex);
+  const logItem = APP_STATE.runtimeLogs[idx];
+  if (!logItem || !logItem.suggestion) return;
+
+  button.disabled = true;
+  button.textContent = "Applying...";
+  try {
+    const result = await applySuggestedPatch(logItem);
+    addActivity(`Patch applied: ${result.applied || 0} change(s). Reloading app.`, "system");
+    persistSoon();
+    setTimeout(() => location.reload(), 1200);
+  } catch (error) {
+    addRuntimeLog(error.message || "Patch apply failed", "patch-agent");
+    renderRuntimeLogs();
+    persistSoon();
+  } finally {
+    button.disabled = false;
+    button.textContent = "Apply Patch";
+  }
+});
+
 ELS.closeModal.addEventListener("click", closePostModal);
 ELS.postModal.addEventListener("click", (event) => {
   if (event.target === ELS.postModal) closePostModal();
@@ -828,6 +1051,16 @@ ELS.postModal.addEventListener("click", (event) => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closePostModal();
+});
+
+window.addEventListener("error", (event) => {
+  const msg = event?.error?.stack || event?.message || "window error";
+  reportRuntimeError(msg, "client");
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event?.reason?.stack || event?.reason?.message || String(event?.reason || "unhandledrejection");
+  reportRuntimeError(reason, "client");
 });
 
 async function init() {
@@ -840,12 +1073,17 @@ async function init() {
   }
 
   await checkApiConfig();
+  if (FORCE_FRESH_BOOT) {
+    setupInitialState();
+  }
   if (!APP_STATE.feed.length && APP_STATE.imageApiReady) {
     seedInitialPosts();
   }
 
   render();
   queueImagesForVisibleFeed();
+  startRuntimeGuardian();
+  pollRuntimeErrors();
   startLoop();
   persistSoon();
 }

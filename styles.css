@@ -204,6 +204,19 @@ button.primary {
   gap: 0.5rem;
 }
 
+#settings-form {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.checkline {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
 .agent-list,
 .feed-list,
 .insights-list {
@@ -247,9 +260,9 @@ button.primary {
 }
 
 .feed-list {
-  overflow: auto;
+  overflow: visible;
   padding-right: 0.25rem;
-  max-height: 74vh;
+  max-height: none;
 }
 
 .post {
