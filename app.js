@@ -12,7 +12,9 @@ const DB_VERSION = 1;
 const DECISION_INTERVAL_MS = 5000;
 const BOT_IMAGE_POST_FACTOR = 0.28;
 const IMAGE_DRAFT_COOLDOWN_TICKS = 3;
-const FORCE_FRESH_BOOT = true;
+const FORCE_FRESH_BOOT = false;
+const SERVER_BOOT_STORAGE_KEY = "gentigram_server_boot_id";
+const IMAGE_CALL_INTERVAL_MS = 3000;
 
 const APP_STATE = {
   running: true,
@@ -30,14 +32,26 @@ const APP_STATE = {
   persistTimer: null,
   userBrowsingFeed: false,
   imageApiReady: false,
+  openAiKeyPresent: false,
+  openAiKeyValidFormat: false,
   imageQueue: [],
   imageJobsActive: 0,
-  imageJobsMax: 2,
+  imageJobsMax: 1,
   lastImageError: "",
   runtimeGuardianEnabled: true,
   runtimeGuardianAutoReload: false,
   runtimeLogs: [],
-  runtimePollTimer: null
+  runtimePollTimer: null,
+  runtimePollFailures: 0,
+  modalLastFocusedEl: null,
+  serverBootId: "",
+  nextImageCallAt: 0,
+  autoScrollTimer: null,
+  selectedAgentId: "all",
+  visualActions: [],
+  chatMessages: [
+    { role: "bot", text: "I am connected in-app. Ask me to debug or improve this app." }
+  ]
 };
 
 const ELS = {
@@ -53,22 +67,28 @@ const ELS = {
   agentStyle: document.getElementById("agent-style"),
   agentPersonality: document.getElementById("agent-personality"),
   agentsList: document.getElementById("agents-list"),
+  agentPov: document.getElementById("agent-pov"),
+  refreshFeedViewBtn: document.getElementById("refresh-feed-view"),
   feedList: document.getElementById("feed-list"),
   feedMeta: document.getElementById("feed-meta"),
   insightsList: document.getElementById("insights-list"),
   superLogList: document.getElementById("super-log-list"),
   imageErrorList: document.getElementById("image-error-list"),
   clearImageErrorsBtn: document.getElementById("clear-image-errors"),
-  sessionApiKey: document.getElementById("session-api-key"),
-  saveApiKeyBtn: document.getElementById("save-api-key"),
   startNewSessionBtn: document.getElementById("start-new-session"),
   guardianToggle: document.getElementById("guardian-toggle"),
   guardianAutoreload: document.getElementById("guardian-autoreload"),
   guardianState: document.getElementById("guardian-state"),
   runtimeErrorList: document.getElementById("runtime-error-list"),
+  chatList: document.getElementById("chat-list"),
+  chatForm: document.getElementById("chat-form"),
+  chatInput: document.getElementById("chat-input"),
   simState: document.getElementById("sim-state"),
   simDot: document.getElementById("sim-state-dot"),
   imageApiState: document.getElementById("image-api-state"),
+  keyMissingBanner: document.getElementById("key-missing-banner"),
+  keyWarningTitle: document.getElementById("key-warning-title"),
+  keyWarningText: document.getElementById("key-warning-text"),
   postModal: document.getElementById("post-modal"),
   closeModal: document.getElementById("close-modal"),
   refreshModalImageBtn: document.getElementById("refresh-modal-image"),
@@ -197,6 +217,16 @@ function normalizePost(post) {
   };
 }
 
+function migrateLegacySeedAuthor(post, agents) {
+  if (post.author !== "seed") return post;
+  const byTopic = agents.find((agent) => agent.style === post.topic);
+  const fallback = agents[0];
+  return {
+    ...post,
+    author: byTopic?.name || fallback?.name || "system"
+  };
+}
+
 function isPostInFeed(postId) {
   return APP_STATE.feed.some((post) => post.id === postId);
 }
@@ -212,7 +242,8 @@ function addActivity(message, type = "system") {
 }
 
 function addImageError(message) {
-  const item = `[t${APP_STATE.tick}] ${message}`;
+  const ts = new Date().toLocaleTimeString();
+  const item = `[${ts}] [t${APP_STATE.tick}] ${message}`;
   APP_STATE.imageErrors.unshift(item);
   APP_STATE.imageErrors = APP_STATE.imageErrors.slice(0, 200);
   APP_STATE.lastImageError = message;
@@ -391,7 +422,9 @@ async function loadState() {
     lastDraftTick: Number(agent.lastDraftTick ?? -1000),
     seenPostIds: new Set(agent.seenPostIds || [])
   }));
-  APP_STATE.feed = posts.map(normalizePost);
+  APP_STATE.feed = posts
+    .map(normalizePost)
+    .map((post) => migrateLegacySeedAuthor(post, APP_STATE.agents));
   APP_STATE.activity = [...events].reverse().slice(0, 350);
   APP_STATE.running = Boolean(meta.running);
   APP_STATE.tick = Number(meta.tick || 0);
@@ -424,7 +457,7 @@ function requestOpenAIImage(prompt) {
   return fetch("/api/generate-image", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, size: "1024x1536" })
+    body: JSON.stringify({ prompt, size: "1024x1024" })
   }).then(async (response) => {
     const payload = await response.json();
     if (!response.ok) {
@@ -487,72 +520,80 @@ function publishPostAfterImage(post, agentId, signal) {
   APP_STATE.feed.unshift(post);
   APP_STATE.feed = APP_STATE.feed.slice(0, 250);
 
-  if (agentId) {
-    const agent = findAgentById(agentId);
-    if (agent) {
-      agent.postsCreated += 1;
-      agent.attention = Math.max(0, agent.attention - 0.6);
-      APP_STATE.insights.unshift(`${agent.name} posted ${post.topic} after scrolling signal ${signal.toFixed(2)}.`);
-      APP_STATE.insights = APP_STATE.insights.slice(0, 10);
-    }
+  const agent = agentId ? findAgentById(agentId) : findAgentByName(post.author);
+  if (agent) {
+    agent.postsCreated += 1;
+  }
+
+  if (agentId && agent) {
+    agent.attention = Math.max(0, agent.attention - 0.6);
+    APP_STATE.insights.unshift(`${agent.name} posted ${post.topic} after scrolling signal ${signal.toFixed(2)}.`);
+    APP_STATE.insights = APP_STATE.insights.slice(0, 10);
   }
 }
 
 function pumpImageQueue() {
   if (!APP_STATE.imageApiReady) return;
+  if (APP_STATE.imageJobsActive >= APP_STATE.imageJobsMax) return;
+  if (APP_STATE.imageQueue.length === 0) return;
 
-  while (APP_STATE.imageJobsActive < APP_STATE.imageJobsMax && APP_STATE.imageQueue.length > 0) {
-    const job = APP_STATE.imageQueue.shift();
-    const { post } = job;
-
-    APP_STATE.imageJobsActive += 1;
-    post.mediaAttempts += 1;
-
-    requestOpenAIImage(job.prompt)
-      .then((imageUrl) => {
-        if (!imageUrl) {
-          throw new Error("Image API returned empty data.");
-        }
-
-        post.mediaUrl = imageUrl;
-        post.mediaStatus = "ready";
-        post.mediaError = "";
-
-        if (job.publishOnSuccess) {
-          publishPostAfterImage(post, job.agentId, job.signal || 0);
-        }
-
-        addActivity(`Image generated for ${post.id} via OpenAI API.`, "image");
-        render();
-        persistSoon();
-      })
-      .catch((error) => {
-        post.mediaStatus = "failed";
-        post.mediaError = error.message || "Unknown image API error";
-        addActivity(`Image failed for ${post.id}: ${post.mediaError}`, "error");
-        addImageError(`post ${post.id}: ${post.mediaError}`);
-
-        if (job.retriesLeft > 0) {
-          setTimeout(() => {
-            const agent = findAgentByName(post.author);
-            enqueueImageGeneration(post, agent?.personalityPrompt || "", {
-              publishOnSuccess: job.publishOnSuccess,
-              agentId: job.agentId,
-              signal: job.signal,
-              retriesLeft: job.retriesLeft - 1,
-              force: false
-            });
-          }, 1000 * (4 - job.retriesLeft));
-        }
-
-        render();
-        persistSoon();
-      })
-      .finally(() => {
-        APP_STATE.imageJobsActive -= 1;
-        pumpImageQueue();
-      });
+  const now = Date.now();
+  if (now < APP_STATE.nextImageCallAt) {
+    setTimeout(() => pumpImageQueue(), APP_STATE.nextImageCallAt - now);
+    return;
   }
+
+  const job = APP_STATE.imageQueue.shift();
+  const { post } = job;
+  APP_STATE.nextImageCallAt = Date.now() + IMAGE_CALL_INTERVAL_MS;
+
+  APP_STATE.imageJobsActive += 1;
+  post.mediaAttempts += 1;
+
+  requestOpenAIImage(job.prompt)
+    .then((imageUrl) => {
+      if (!imageUrl) {
+        throw new Error("Image API returned empty data.");
+      }
+
+      post.mediaUrl = imageUrl;
+      post.mediaStatus = "ready";
+      post.mediaError = "";
+
+      if (job.publishOnSuccess) {
+        publishPostAfterImage(post, job.agentId, job.signal || 0);
+      }
+
+      addActivity(`Image generated for ${post.id} via OpenAI API.`, "image");
+      render();
+      persistSoon();
+    })
+    .catch((error) => {
+      post.mediaStatus = "failed";
+      post.mediaError = error.message || "Unknown image API error";
+      addActivity(`Image failed for ${post.id}: ${post.mediaError}`, "error");
+      addImageError(`post ${post.id}: ${post.mediaError}`);
+
+      if (job.retriesLeft > 0) {
+        setTimeout(() => {
+          const agent = findAgentByName(post.author);
+          enqueueImageGeneration(post, agent?.personalityPrompt || "", {
+            publishOnSuccess: job.publishOnSuccess,
+            agentId: job.agentId,
+            signal: job.signal,
+            retriesLeft: job.retriesLeft - 1,
+            force: false
+          });
+        }, 1000 * (4 - job.retriesLeft));
+      }
+
+      render();
+      persistSoon();
+    })
+    .finally(() => {
+      APP_STATE.imageJobsActive -= 1;
+      pumpImageQueue();
+    });
 }
 
 async function checkApiConfig() {
@@ -561,20 +602,81 @@ async function checkApiConfig() {
     if (!response.ok) throw new Error("config unavailable");
     const payload = await response.json();
     APP_STATE.imageApiReady = Boolean(payload.imageApiReady);
+    APP_STATE.openAiKeyPresent = Boolean(payload.openAiKeyPresent);
+    APP_STATE.openAiKeyValidFormat = Boolean(payload.openAiKeyValidFormat);
+    APP_STATE.serverBootId = String(payload.serverBootId || "");
   } catch {
     APP_STATE.imageApiReady = false;
+    APP_STATE.openAiKeyPresent = false;
+    APP_STATE.openAiKeyValidFormat = false;
+    APP_STATE.serverBootId = "";
   }
 }
 
-async function saveSessionApiKey(apiKey) {
-  const response = await fetch("/api/session/openai-key", {
+function buildChatContextSnapshot() {
+  return {
+    running: APP_STATE.running,
+    tick: APP_STATE.tick,
+    tickMs: APP_STATE.tickMs,
+    creativityPercent: APP_STATE.creativityPercent,
+    imageApiReady: APP_STATE.imageApiReady,
+    selectedAgentId: APP_STATE.selectedAgentId,
+    selectedAgent:
+      APP_STATE.selectedAgentId === "all"
+        ? "all"
+        : APP_STATE.agents.find((a) => a.id === APP_STATE.selectedAgentId)?.name || "unknown",
+    agents: APP_STATE.agents.slice(0, 12).map((agent) => ({
+      name: agent.name,
+      style: agent.style,
+      attention: Number(agent.attention.toFixed(2)),
+      postsCreated: agent.postsCreated,
+      likesGiven: agent.likesGiven
+    })),
+    feedTop: APP_STATE.feed.slice(0, 12).map((post) => ({
+      id: post.id,
+      author: post.author,
+      topic: post.topic,
+      likes: post.likes,
+      mediaStatus: post.mediaStatus
+    })),
+    insights: APP_STATE.insights.slice(0, 8),
+    imageErrors: APP_STATE.imageErrors.slice(0, 8),
+    runtimeLogs: APP_STATE.runtimeLogs.slice(0, 6).map((item) => ({
+      source: item.source,
+      message: item.message
+    })),
+    activity: APP_STATE.activity.slice(0, 12).map((item) => item.message)
+  };
+}
+
+async function sendChatMessage(message) {
+  const response = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ apiKey })
+    body: JSON.stringify({
+      message,
+      history: APP_STATE.chatMessages.slice(-8),
+      appContext: buildChatContextSnapshot()
+    })
   });
+  const payload = await response.json();
   if (!response.ok) {
-    const payload = await response.json();
-    throw new Error(payload.error || "Failed to save API key");
+    throw new Error(payload.error || "Chat API failed");
+  }
+  return String(payload.reply || "").trim();
+}
+
+function handleServerRestartReset() {
+  if (!APP_STATE.serverBootId) return;
+  const previous = localStorage.getItem(SERVER_BOOT_STORAGE_KEY);
+  if (!previous) {
+    localStorage.setItem(SERVER_BOOT_STORAGE_KEY, APP_STATE.serverBootId);
+    return;
+  }
+  if (previous !== APP_STATE.serverBootId) {
+    localStorage.setItem(SERVER_BOOT_STORAGE_KEY, APP_STATE.serverBootId);
+    APP_STATE.running = false;
+    resetDatabaseAndReload();
   }
 }
 
@@ -634,10 +736,14 @@ async function pollRuntimeErrors() {
   if (!APP_STATE.runtimeGuardianEnabled) return;
   try {
     const response = await fetch("/api/runtime-errors");
-    if (!response.ok) return;
+    if (!response.ok) {
+      APP_STATE.runtimePollFailures += 1;
+      return;
+    }
     const payload = await response.json();
     const errors = Array.isArray(payload.errors) ? payload.errors : [];
     if (!errors.length) return;
+    APP_STATE.runtimePollFailures = 0;
 
     const newest = errors[0];
     const signature = `${newest.at}|${newest.source}|${newest.message}`;
@@ -648,7 +754,7 @@ async function pollRuntimeErrors() {
       await reportRuntimeError(newest.message, newest.source || "server");
     }
   } catch {
-    // no-op
+    APP_STATE.runtimePollFailures += 1;
   }
 }
 
@@ -657,6 +763,8 @@ function startRuntimeGuardian() {
     clearInterval(APP_STATE.runtimePollTimer);
   }
   APP_STATE.runtimePollTimer = setInterval(() => {
+    if (document.hidden) return;
+    if (APP_STATE.runtimePollFailures >= 6) return;
     pollRuntimeErrors();
   }, 5000);
 }
@@ -691,11 +799,17 @@ function runTick() {
     agent.seenPostIds.add(viewed.post.id);
     agent.attention += viewed.score;
     addActivity(`${agent.name} viewed @${viewed.post.author} (${viewed.post.topic}).`, "view");
+    if (APP_STATE.selectedAgentId === "all" || APP_STATE.selectedAgentId === agent.id) {
+      pushVisualAction({ type: "view", postId: viewed.post.id, agentId: agent.id });
+    }
 
     if (viewed.score > 0.55 && Math.random() > 0.35) {
       viewed.post.likes += 1;
       agent.likesGiven += 1;
       addActivity(`${agent.name} liked post ${viewed.post.id}.`, "like");
+      if (APP_STATE.selectedAgentId === "all" || APP_STATE.selectedAgentId === agent.id) {
+        pushVisualAction({ type: "like", postId: viewed.post.id, agentId: agent.id });
+      }
     }
 
     const boostedChance =
@@ -766,17 +880,20 @@ function renderPostMedia(post) {
     return `<img class="media-image" src="${esc(post.mediaUrl)}" alt="${esc(post.mediaTitle)}" loading="lazy" />`;
   }
 
-  return `<span class="media-kicker">PHOTO</span><span class="media-title">${esc(post.mediaTitle)}</span><span class="media-status">Generating image...</span>`;
+  if (post.mediaStatus === "failed") {
+    return `<div class="media-skeleton media-skeleton--error"><span class="skeleton-label">Image failed</span></div>`;
+  }
+  return `<div class="media-skeleton"><div class="skeleton-shimmer"></div><span class="skeleton-label">${esc(post.mediaTitle)}</span></div>`;
 }
 
 function renderFeed() {
   const previousScrollTop = ELS.feedList.scrollTop;
   const visible = APP_STATE.feed.slice(0, 70);
-  ELS.feedMeta.textContent = `${APP_STATE.feed.length} posts${APP_STATE.userBrowsingFeed ? " · manual browse" : ""}`;
+  ELS.feedMeta.textContent = `${APP_STATE.feed.length} posts`;
   ELS.feedList.innerHTML = visible
     .map(
       (post) => `
-      <article class="post" data-post-id="${esc(post.id)}" role="button" tabindex="0">
+      <article class="post" data-post-id="${esc(post.id)}" role="button" tabindex="0" aria-label="Open post by ${esc(post.author)}">
         <div class="post-media" style="background:${esc(post.mediaGradient)}">${renderPostMedia(post)}</div>
         <strong>@${esc(post.author)}</strong>
         <p>${esc(post.caption)}</p>
@@ -787,7 +904,9 @@ function renderFeed() {
       </article>`
     )
     .join("");
-  ELS.feedList.scrollTop = previousScrollTop;
+  if (APP_STATE.userBrowsingFeed) {
+    ELS.feedList.scrollTop = previousScrollTop;
+  }
 }
 
 function renderInsights() {
@@ -811,10 +930,10 @@ function renderRuntimeLogs() {
   ELS.runtimeErrorList.innerHTML = APP_STATE.runtimeLogs.length
     ? APP_STATE.runtimeLogs
         .slice(0, 80)
-        .map((item, idx) => {
+        .map((item) => {
           const suggestion = item.suggestion ? `<br/><strong>Fix:</strong> ${esc(item.suggestion)}` : "";
           const action = item.suggestion
-            ? `<div class="button-row"><button type="button" class="apply-patch-btn" data-log-index="${idx}">Apply Patch</button></div>`
+            ? `<div class="button-row"><button type="button" class="apply-patch-btn" data-log-id="${esc(item.id)}">Apply Patch</button></div>`
             : "";
           return `<li>[${esc(item.source)}] ${esc(item.message)}${suggestion}${action}</li>`;
         })
@@ -840,17 +959,89 @@ function renderControlValues() {
   ELS.imageApiState.textContent = APP_STATE.imageApiReady
     ? `Image API: OpenAI connected${APP_STATE.lastImageError ? ` (last error: ${APP_STATE.lastImageError})` : ""}`
     : "Image API: unavailable (start server with OPENAI_API_KEY)";
+  ELS.keyMissingBanner.classList.toggle("hidden", APP_STATE.imageApiReady);
+  if (!APP_STATE.imageApiReady) {
+    if (APP_STATE.openAiKeyPresent && !APP_STATE.openAiKeyValidFormat) {
+      ELS.keyWarningTitle.textContent = "OpenAI key detected, but format looks invalid.";
+      ELS.keyWarningText.innerHTML =
+        "Use a terminal key that starts with <code>sk-</code>. Avoid quotes, spaces, or line breaks. Example: <code>OPENAI_API_KEY=sk-... npm start</code>.";
+    } else {
+      ELS.keyWarningTitle.textContent = "OpenAI key missing.";
+      ELS.keyWarningText.innerHTML =
+        "Start server with <code>OPENAI_API_KEY=sk-... npm start</code> to enable feed image posting.";
+    }
+  }
   ELS.guardianToggle.checked = APP_STATE.runtimeGuardianEnabled;
   ELS.guardianAutoreload.checked = APP_STATE.runtimeGuardianAutoReload;
 }
 
+function renderChat() {
+  const atBottom = ELS.chatList.scrollHeight - ELS.chatList.scrollTop <= ELS.chatList.clientHeight + 10;
+  ELS.chatList.innerHTML = APP_STATE.chatMessages
+    .map((msg) => `<article class="chat-msg ${msg.role === "me" ? "me" : "bot"}">${esc(msg.text)}</article>`)
+    .join("");
+  if (atBottom) {
+    ELS.chatList.scrollTop = ELS.chatList.scrollHeight;
+  }
+}
+
+function renderAgentPovOptions() {
+  const options = [
+    `<option value="all">All Agents (Auto)</option>`,
+    ...APP_STATE.agents.map((agent) => `<option value="${esc(agent.id)}">${esc(agent.name)}</option>`)
+  ];
+  ELS.agentPov.innerHTML = options.join("");
+  ELS.agentPov.value = APP_STATE.selectedAgentId;
+}
+
+function pushVisualAction(action) {
+  APP_STATE.visualActions.push(action);
+  APP_STATE.visualActions = APP_STATE.visualActions.slice(-20);
+}
+
+function applyVisualActions() {
+  const actions = APP_STATE.visualActions.splice(0);
+  actions.forEach((action) => {
+    const card = ELS.feedList.querySelector(`[data-post-id="${action.postId}"]`);
+    if (!card) return;
+    card.classList.add("agent-focus");
+    card.scrollIntoView({ block: "center", behavior: "smooth" });
+    setTimeout(() => card.classList.remove("agent-focus"), 1200);
+    if (action.type === "like") {
+      const heart = document.createElement("span");
+      heart.className = "heart-bubble";
+      heart.textContent = "❤";
+      card.appendChild(heart);
+      setTimeout(() => heart.remove(), 1000);
+    }
+  });
+}
+
+function startAutoFeedScroll() {
+  if (APP_STATE.autoScrollTimer) {
+    clearInterval(APP_STATE.autoScrollTimer);
+  }
+  APP_STATE.autoScrollTimer = setInterval(() => {
+    if (!APP_STATE.running) return;
+    const el = ELS.feedList;
+    if (!el) return;
+    const max = el.scrollHeight - el.clientHeight;
+    if (max <= 0) return;
+    const next = el.scrollTop + 1.4;
+    el.scrollTop = next >= max ? 0 : next;
+  }, 35);
+}
+
 function render() {
   renderAgents();
+  renderAgentPovOptions();
   renderFeed();
+  applyVisualActions();
   renderInsights();
   renderSuperLog();
   renderImageErrors();
   renderRuntimeLogs();
+  renderChat();
   renderSimState();
   renderControlValues();
 }
@@ -858,6 +1049,7 @@ function render() {
 function openPostModal(postId) {
   const post = APP_STATE.feed.find((item) => item.id === postId);
   if (!post) return;
+  APP_STATE.modalLastFocusedEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
 
   const recs = APP_STATE.agents
     .map((agent) => ({ agent: agent.name, score: recommendationScore(agent, post) }))
@@ -876,20 +1068,15 @@ function openPostModal(postId) {
   ELS.refreshModalImageBtn.dataset.postId = post.id;
   ELS.postModal.classList.remove("hidden");
   ELS.postModal.setAttribute("aria-hidden", "false");
+  ELS.closeModal.focus();
 }
 
 function closePostModal() {
   ELS.postModal.classList.add("hidden");
   ELS.postModal.setAttribute("aria-hidden", "true");
-}
-
-function pauseForManualBrowse() {
-  if (APP_STATE.userBrowsingFeed) return;
-  APP_STATE.userBrowsingFeed = true;
-  APP_STATE.running = false;
-  addActivity("Simulation paused for manual feed browsing.", "system");
-  render();
-  persistSoon();
+  if (APP_STATE.modalLastFocusedEl) {
+    APP_STATE.modalLastFocusedEl.focus();
+  }
 }
 
 ELS.speed.addEventListener("input", (event) => {
@@ -918,6 +1105,8 @@ ELS.stepBtn.addEventListener("click", () => {
 });
 
 ELS.resetBtn.addEventListener("click", () => {
+  const ok = window.confirm("Reset simulation state and regenerate starter content?");
+  if (!ok) return;
   APP_STATE.tick = 0;
   APP_STATE.nextPostSeq = 1;
   APP_STATE.userBrowsingFeed = false;
@@ -951,15 +1140,37 @@ ELS.feedList.addEventListener("click", (event) => {
 });
 
 ELS.feedList.addEventListener("keydown", (event) => {
-  if (event.key !== "Enter") return;
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
   const card = event.target.closest(".post");
   if (!card) return;
   openPostModal(card.dataset.postId);
 });
 
-ELS.feedList.addEventListener("wheel", pauseForManualBrowse, { passive: true });
-ELS.feedList.addEventListener("touchstart", pauseForManualBrowse, { passive: true });
-ELS.feedList.addEventListener("scroll", pauseForManualBrowse, { passive: true });
+ELS.agentPov.addEventListener("change", (event) => {
+  APP_STATE.selectedAgentId = event.target.value;
+});
+
+ELS.refreshFeedViewBtn.addEventListener("click", () => {
+  renderFeed();
+  queueImagesForVisibleFeed();
+});
+
+ELS.chatForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const text = ELS.chatInput.value.trim();
+  if (!text) return;
+  APP_STATE.chatMessages.push({ role: "me", text });
+  ELS.chatInput.value = "";
+  renderChat();
+  try {
+    const reply = await sendChatMessage(text);
+    APP_STATE.chatMessages.push({ role: "bot", text: reply || "No response returned." });
+  } catch (error) {
+    APP_STATE.chatMessages.push({ role: "bot", text: `Chat error: ${error.message || "unknown error"}` });
+  }
+  renderChat();
+});
 
 ELS.refreshModalImageBtn.addEventListener("click", () => {
   const postId = ELS.refreshModalImageBtn.dataset.postId;
@@ -984,28 +1195,16 @@ ELS.clearImageErrorsBtn.addEventListener("click", () => {
   persistSoon();
 });
 
-ELS.saveApiKeyBtn.addEventListener("click", async () => {
-  const key = ELS.sessionApiKey.value.trim();
-  if (!key) return;
-  try {
-    await saveSessionApiKey(key);
-    ELS.sessionApiKey.value = "";
-    await checkApiConfig();
-    addActivity("Session API key saved in server memory.", "system");
-    render();
-    queueImagesForVisibleFeed();
-    persistSoon();
-  } catch (error) {
-    addRuntimeLog(error.message || "Failed to save session key", "settings");
-    renderRuntimeLogs();
-  }
-});
-
 ELS.startNewSessionBtn.addEventListener("click", () => {
+  const ok = window.confirm(
+    "Wipe all local simulation data and reload? This cannot be undone."
+  );
+  if (!ok) return;
   APP_STATE.running = false;
   APP_STATE.imageQueue = [];
   APP_STATE.runtimeLogs = [];
   APP_STATE.imageErrors = [];
+  APP_STATE.chatMessages = [{ role: "bot", text: "Session reset. I am ready." }];
   resetDatabaseAndReload();
 });
 
@@ -1023,8 +1222,8 @@ ELS.guardianAutoreload.addEventListener("change", (event) => {
 ELS.runtimeErrorList.addEventListener("click", async (event) => {
   const button = event.target.closest(".apply-patch-btn");
   if (!button) return;
-  const idx = Number(button.dataset.logIndex);
-  const logItem = APP_STATE.runtimeLogs[idx];
+  const logId = button.dataset.logId;
+  const logItem = APP_STATE.runtimeLogs.find((item) => item.id === logId);
   if (!logItem || !logItem.suggestion) return;
 
   button.disabled = true;
@@ -1051,6 +1250,19 @@ ELS.postModal.addEventListener("click", (event) => {
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closePostModal();
+  if (!ELS.postModal.classList.contains("hidden") && event.key === "Tab") {
+    const focusables = [ELS.refreshModalImageBtn, ELS.closeModal].filter(Boolean);
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (!first || !last) return;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
 });
 
 window.addEventListener("error", (event) => {
@@ -1073,6 +1285,7 @@ async function init() {
   }
 
   await checkApiConfig();
+  handleServerRestartReset();
   if (FORCE_FRESH_BOOT) {
     setupInitialState();
   }
@@ -1082,6 +1295,7 @@ async function init() {
 
   render();
   queueImagesForVisibleFeed();
+  startAutoFeedScroll();
   startRuntimeGuardian();
   pollRuntimeErrors();
   startLoop();

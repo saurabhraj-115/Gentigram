@@ -73,6 +73,26 @@ h1 {
   gap: 0.5rem;
 }
 
+.hidden {
+  display: none !important;
+}
+
+.startup-warning {
+  max-width: 1300px;
+  margin: 0 auto 0.6rem;
+  padding: 0.7rem 1rem;
+  border: 1px solid #d45541;
+  border-left: 6px solid #c7361f;
+  border-radius: 12px;
+  background: #fff1ed;
+  color: #6b1b0f;
+  display: flex;
+  gap: 0.65rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+  box-shadow: 0 8px 20px rgba(130, 38, 21, 0.12);
+}
+
 .dot {
   width: 10px;
   height: 10px;
@@ -98,6 +118,7 @@ h1 {
   grid-template-columns: 300px 1.35fr 1fr;
   grid-template-areas:
     "controls feed agents"
+    "controls feed chat"
     "controls feed insights"
     "controls feed superlog";
   gap: 1rem;
@@ -132,6 +153,13 @@ h1 {
 
 .super-log {
   grid-area: superlog;
+}
+
+.chat {
+  grid-area: chat;
+  display: flex;
+  flex-direction: column;
+  min-height: 340px;
 }
 
 h2,
@@ -192,6 +220,14 @@ button {
   cursor: pointer;
 }
 
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 2px;
+}
+
 button.primary {
   background: var(--text);
   border-color: var(--text);
@@ -207,6 +243,11 @@ button.primary {
 #settings-form {
   display: grid;
   gap: 0.5rem;
+}
+
+#key-save-status {
+  color: var(--muted);
+  font-size: 0.82rem;
 }
 
 .checkline {
@@ -259,10 +300,17 @@ button.primary {
   gap: 1rem;
 }
 
+.feed-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .feed-list {
-  overflow: visible;
+  overflow: auto;
   padding-right: 0.25rem;
-  max-height: none;
+  max-height: 74vh;
+  min-height: 60vh;
 }
 
 .post {
@@ -272,6 +320,7 @@ button.primary {
   padding: 0.7rem;
   animation: appear 0.4s ease;
   cursor: pointer;
+  position: relative;
 }
 
 .post p {
@@ -323,6 +372,20 @@ button.primary {
   object-fit: cover;
 }
 
+.post.agent-focus {
+  box-shadow: 0 0 0 2px rgba(29, 120, 116, 0.4);
+  transform: scale(1.003);
+}
+
+.heart-bubble {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  font-size: 1.4rem;
+  animation: heartUp 0.95s ease forwards;
+  pointer-events: none;
+}
+
 .post-foot {
   display: flex;
   justify-content: space-between;
@@ -360,6 +423,36 @@ button.primary {
   border-radius: 10px;
   padding: 0.5rem 0.6rem;
   font-size: 0.82rem;
+}
+
+.chat-list {
+  display: grid;
+  gap: 0.45rem;
+  max-height: 260px;
+  overflow: auto;
+  margin-bottom: 0.6rem;
+}
+
+.chat-msg {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  padding: 0.45rem 0.6rem;
+  font-size: 0.86rem;
+}
+
+.chat-msg.me {
+  border-left: 3px solid var(--accent-2);
+}
+
+.chat-msg.bot {
+  border-left: 3px solid var(--accent);
+}
+
+.chat-form {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.45rem;
 }
 
 .modal {
@@ -412,6 +505,11 @@ button.primary {
   margin: 0 auto 2rem;
 }
 
+.runtime-panel {
+  border-color: #b9b4d9;
+  background: linear-gradient(180deg, #fbfaff 0%, #f2f0ff 100%);
+}
+
 .image-error-list {
   list-style: none;
   margin: 0;
@@ -429,6 +527,62 @@ button.primary {
   border-radius: 10px;
   padding: 0.5rem 0.6rem;
   font-size: 0.82rem;
+}
+
+#settings-status {
+  color: var(--muted);
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.media-skeleton {
+  width: 100%;
+  min-height: 140px;
+  border-radius: 10px;
+  background: var(--surface-alt);
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: flex-end;
+  padding: 0.5rem 0.6rem;
+}
+
+.media-skeleton--error {
+  background: #fdf0ee;
+}
+
+.skeleton-shimmer {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.55) 50%, transparent 100%);
+  animation: shimmer 1.4s infinite;
+}
+
+.skeleton-label {
+  position: relative;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  z-index: 1;
+}
+
+@keyframes heartUp {
+  0% {
+    opacity: 0.1;
+    transform: translateY(10px) scale(0.7);
+  }
+  35% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-26px) scale(1.15);
+  }
 }
 
 @keyframes appear {
@@ -449,7 +603,8 @@ button.primary {
     grid-template-areas:
       "controls controls"
       "feed feed"
-      "agents insights"
+      "agents chat"
+      "insights insights"
       "superlog superlog";
   }
 
@@ -473,6 +628,7 @@ button.primary {
     grid-template-areas:
       "controls"
       "agents"
+      "chat"
       "insights"
       "superlog"
       "feed";

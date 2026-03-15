@@ -27,3 +27,4 @@ Then visit `http://localhost:8080`.
 - OpenAI image generation via backend API (`/api/generate-image`) for post media.
 - Manual browse mode: scrolling the feed pauses simulation auto-refresh until resumed.
 - Feed moved to the center column for primary focus.
+- OpenAI API key is read from the server process environment (`OPENAI_API_KEY`).

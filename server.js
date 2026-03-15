@@ -2,11 +2,32 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
+// Load .env file into process.env (no dotenv dependency needed)
+(function loadEnv() {
+  try {
+    const envPath = path.join(__dirname, '.env');
+    const lines = fs.readFileSync(envPath, 'utf-8').split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq < 0) continue;
+      const key = trimmed.slice(0, eq).trim();
+      const val = trimmed.slice(eq + 1).trim().replace(/^['"]|['"]$/g, '');
+      if (key && !(key in process.env)) process.env[key] = val;
+    }
+  } catch {
+    // .env not present — rely on system environment variables
+  }
+})();
+
 const PORT = Number(process.env.PORT || 8080);
 const ROOT = __dirname;
 const IMAGE_MODEL = 'gpt-image-1';
 const FIX_MODEL = 'gpt-4.1-mini';
-let OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const MAX_BODY_BYTES = 256 * 1024;
+const SERVER_BOOT_ID = `${Date.now()}`;
+const OPENAI_API_KEY = normalizeApiKey(process.env.OPENAI_API_KEY || '');
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -21,6 +42,14 @@ const MIME_TYPES = {
 
 const runtimeErrors = [];
 const PATCHABLE_FILES = new Set(['app.js', 'server.js', 'index.html', 'styles.css']);
+const rateLimitStore = new Map();
+
+function normalizeApiKey(rawValue) {
+  const raw = String(rawValue || '');
+  const compact = raw.trim().replace(/\s+/g, '');
+  const matched = compact.match(/sk-[A-Za-z0-9_-]+/);
+  return matched ? matched[0] : compact;
+}
 
 function addRuntimeError(message, source = 'server') {
   runtimeErrors.unshift({
@@ -33,6 +62,10 @@ function addRuntimeError(message, source = 'server') {
   }
 }
 
+function hasValidOpenAIKey() {
+  return OPENAI_API_KEY.startsWith('sk-') && OPENAI_API_KEY.length >= 20;
+}
+
 function sendJson(res, code, payload) {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(payload));
@@ -40,11 +73,48 @@ function sendJson(res, code, payload) {
 
 async function parseBody(req) {
   const chunks = [];
+  let size = 0;
   for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) {
+      throw new Error('Request body too large');
+    }
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
   return JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+}
+
+function isLocalRequest(req) {
+  const ip = req.socket.remoteAddress || '';
+  return (
+    ip === '::1' ||
+    ip === '127.0.0.1' ||
+    ip === '::ffff:127.0.0.1'
+  );
+}
+
+function isTrustedOrigin(req) {
+  const origin = String(req.headers.origin || '');
+  if (!origin) return true;
+  return origin.startsWith('http://localhost:') || origin.startsWith('http://127.0.0.1:');
+}
+
+function enforceRateLimit(req, res, key, maxRequests, windowMs) {
+  const ip = req.socket.remoteAddress || 'unknown';
+  const bucketKey = `${ip}:${key}`;
+  const now = Date.now();
+  const current = rateLimitStore.get(bucketKey);
+  if (!current || now > current.resetAt) {
+    rateLimitStore.set(bucketKey, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (current.count >= maxRequests) {
+    sendJson(res, 429, { error: 'Rate limit exceeded' });
+    return false;
+  }
+  current.count += 1;
+  return true;
 }
 
 function resolveFile(urlPath) {
@@ -99,7 +169,7 @@ async function callOpenAIJson(endpoint, payload) {
 }
 
 async function handleImageGeneration(req, res) {
-  if (!OPENAI_API_KEY) {
+  if (!hasValidOpenAIKey()) {
     sendJson(res, 503, { error: 'OPENAI_API_KEY missing', imageUrl: '' });
     return;
   }
@@ -107,8 +177,8 @@ async function handleImageGeneration(req, res) {
   let body;
   try {
     body = await parseBody(req);
-  } catch {
-    sendJson(res, 400, { error: 'Invalid JSON', imageUrl: '' });
+  } catch (error) {
+    sendJson(res, error.message === 'Request body too large' ? 413 : 400, { error: error.message, imageUrl: '' });
     return;
   }
 
@@ -124,6 +194,7 @@ async function handleImageGeneration(req, res) {
       model: IMAGE_MODEL,
       prompt,
       size: chosenSize,
+      quality: 'low',
       n: 1
     });
   }
@@ -149,7 +220,7 @@ async function handleImageGeneration(req, res) {
 }
 
 async function handleFixSuggestion(req, res) {
-  if (!OPENAI_API_KEY) {
+  if (!hasValidOpenAIKey()) {
     sendJson(res, 503, { error: 'OPENAI_API_KEY missing', suggestion: '' });
     return;
   }
@@ -157,8 +228,8 @@ async function handleFixSuggestion(req, res) {
   let body;
   try {
     body = await parseBody(req);
-  } catch {
-    sendJson(res, 400, { error: 'Invalid JSON', suggestion: '' });
+  } catch (error) {
+    sendJson(res, error.message === 'Request body too large' ? 413 : 400, { error: error.message, suggestion: '' });
     return;
   }
 
@@ -194,7 +265,7 @@ async function handleFixSuggestion(req, res) {
 }
 
 async function handleApplySuggestedPatch(req, res) {
-  if (!OPENAI_API_KEY) {
+  if (!hasValidOpenAIKey()) {
     sendJson(res, 503, { error: 'OPENAI_API_KEY missing' });
     return;
   }
@@ -202,8 +273,8 @@ async function handleApplySuggestedPatch(req, res) {
   let body;
   try {
     body = await parseBody(req);
-  } catch {
-    sendJson(res, 400, { error: 'Invalid JSON' });
+  } catch (error) {
+    sendJson(res, error.message === 'Request body too large' ? 413 : 400, { error: error.message });
     return;
   }
 
@@ -214,12 +285,16 @@ async function handleApplySuggestedPatch(req, res) {
     return;
   }
 
+  const match = `${errorText}\n${suggestion}`.toLowerCase();
+  const prioritized = Array.from(PATCHABLE_FILES).filter((rel) => match.includes(rel));
+  const targetFiles = prioritized.length ? prioritized : ['app.js'];
   const filePayload = {};
-  for (const rel of PATCHABLE_FILES) {
+  for (const rel of targetFiles) {
     const abs = safeWorkspacePath(rel);
     if (!abs) continue;
     try {
-      filePayload[rel] = fs.readFileSync(abs, 'utf-8');
+      const full = fs.readFileSync(abs, 'utf-8');
+      filePayload[rel] = full.slice(0, 4500);
     } catch {
       filePayload[rel] = '';
     }
@@ -239,7 +314,7 @@ async function handleApplySuggestedPatch(req, res) {
         role: 'user',
         content:
           `Runtime error:\\n${errorText}\\n\\nSuggested fix:\\n${suggestion}\\n\\n` +
-          `Current files JSON:\\n${JSON.stringify(filePayload)}`
+          `Partial relevant file contents JSON:\\n${JSON.stringify(filePayload)}`
       }
     ]
   });
@@ -284,41 +359,105 @@ async function handleApplySuggestedPatch(req, res) {
   sendJson(res, 200, { ok: true, applied, files: Array.from(changedFiles) });
 }
 
+async function handleChat(req, res) {
+  if (!hasValidOpenAIKey()) {
+    sendJson(res, 503, { error: 'OPENAI_API_KEY missing', reply: '' });
+    return;
+  }
+
+  let body;
+  try {
+    body = await parseBody(req);
+  } catch (error) {
+    sendJson(res, error.message === 'Request body too large' ? 413 : 400, { error: error.message, reply: '' });
+    return;
+  }
+
+  const message = String(body.message || '').trim();
+  const history = Array.isArray(body.history) ? body.history.slice(-10) : [];
+  const appContext = body.appContext && typeof body.appContext === 'object' ? body.appContext : {};
+  if (!message) {
+    sendJson(res, 400, { error: 'message is required', reply: '' });
+    return;
+  }
+
+  const historyText = history
+    .map((item) => `${item.role === 'me' ? 'User' : 'Assistant'}: ${String(item.text || '')}`)
+    .join('\n');
+
+  const { response, data } = await callOpenAIJson('responses', {
+    model: FIX_MODEL,
+    input: [
+      {
+        role: 'system',
+        content:
+          'You are the in-app Gentigram assistant. Answer concisely and prioritize actionable steps based on provided app state.'
+      },
+      {
+        role: 'user',
+        content:
+          `App context JSON:\n${JSON.stringify(appContext)}\n\nRecent chat:\n${historyText}\n\nUser message:\n${message}`
+      }
+    ]
+  });
+
+  if (!response.ok) {
+    const msg = data?.error?.message || 'Chat API error';
+    sendJson(res, response.status, { error: msg, reply: '' });
+    return;
+  }
+
+  sendJson(res, 200, { reply: String(data.output_text || '').trim() });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.url === '/api/config' && req.method === 'GET') {
       sendJson(res, 200, {
-        imageApiReady: Boolean(OPENAI_API_KEY),
+        imageApiReady: hasValidOpenAIKey(),
+        openAiKeyPresent: OPENAI_API_KEY.length > 0,
+        openAiKeyValidFormat: hasValidOpenAIKey(),
         imageModel: IMAGE_MODEL,
-        fixModel: FIX_MODEL
+        fixModel: FIX_MODEL,
+        serverBootId: SERVER_BOOT_ID
       });
       return;
     }
 
-    if (req.url === '/api/session/openai-key' && req.method === 'POST') {
-      const body = await parseBody(req);
-      const key = String(body.apiKey || '').trim();
-      OPENAI_API_KEY = key;
-      sendJson(res, 200, { ok: true, configured: Boolean(OPENAI_API_KEY) });
-      return;
-    }
-
     if (req.url === '/api/runtime-errors' && req.method === 'GET') {
+      if (!isLocalRequest(req) || !isTrustedOrigin(req)) {
+        sendJson(res, 403, { error: 'local-only endpoint' });
+        return;
+      }
+      if (!enforceRateLimit(req, res, 'runtime-errors', 120, 60_000)) return;
       sendJson(res, 200, { errors: runtimeErrors });
       return;
     }
 
     if (req.url === '/api/suggest-fix' && req.method === 'POST') {
+      if (!enforceRateLimit(req, res, 'suggest-fix', 20, 60_000)) return;
       await handleFixSuggestion(req, res);
       return;
     }
 
+    if (req.url === '/api/chat' && req.method === 'POST') {
+      if (!enforceRateLimit(req, res, 'chat', 40, 60_000)) return;
+      await handleChat(req, res);
+      return;
+    }
+
     if (req.url === '/api/apply-suggested-patch' && req.method === 'POST') {
+      if (!isLocalRequest(req) || !isTrustedOrigin(req)) {
+        sendJson(res, 403, { error: 'local-only endpoint' });
+        return;
+      }
+      if (!enforceRateLimit(req, res, 'apply-patch', 10, 60_000)) return;
       await handleApplySuggestedPatch(req, res);
       return;
     }
 
     if (req.url === '/api/generate-image' && req.method === 'POST') {
+      if (!enforceRateLimit(req, res, 'generate-image', 80, 60_000)) return;
       await handleImageGeneration(req, res);
       return;
     }
@@ -336,7 +475,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     const ext = path.extname(filePath).toLowerCase();
-    res.writeHead(200, { 'Content-Type': MIME_TYPES[ext] || 'application/octet-stream' });
+    res.writeHead(200, {
+      'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'SAMEORIGIN',
+      'Referrer-Policy': 'strict-origin-when-cross-origin'
+    });
     fs.createReadStream(filePath).pipe(res);
   } catch (error) {
     addRuntimeError(error?.stack || error?.message || 'Unhandled server error', 'server');

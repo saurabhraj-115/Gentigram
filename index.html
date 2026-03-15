@@ -28,6 +28,10 @@
         <small id="image-api-state">Image API: checking...</small>
       </div>
     </header>
+    <section id="key-missing-banner" class="startup-warning hidden" role="alert" aria-live="polite">
+      <strong id="key-warning-title">OpenAI key missing.</strong>
+      <span id="key-warning-text">Start server with <code>OPENAI_API_KEY=sk-... npm start</code> to enable feed image posting.</span>
+    </section>
 
     <main class="grid">
       <section class="panel controls">
@@ -45,16 +49,12 @@
         <div class="button-row">
           <button id="toggle-sim" class="primary">Pause</button>
           <button id="tick-once">Step</button>
-          <button id="reset-feed">Reset Feed</button>
+          <button id="reset-feed">Reset Simulation</button>
         </div>
 
         <h3>Settings</h3>
         <div id="settings-form">
-          <input id="session-api-key" type="password" placeholder="OpenAI API key (session only)" />
-          <div class="button-row">
-            <button id="save-api-key" type="button">Save Key</button>
-            <button id="start-new-session" type="button">Start New Session</button>
-          </div>
+          <button id="start-new-session" type="button">Wipe Local Data</button>
           <label class="checkline">
             <input id="guardian-toggle" type="checkbox" checked />
             Runtime guardian auto-monitor
@@ -91,10 +91,26 @@
         <div id="agents-list" class="agent-list"></div>
       </section>
 
+      <section class="panel chat">
+        <div class="feed-header">
+          <h2>Chat With Codex</h2>
+          <small>In-app assistant</small>
+        </div>
+        <div id="chat-list" class="chat-list"></div>
+        <form id="chat-form" class="chat-form">
+          <input id="chat-input" placeholder="Ask anything about the app..." required />
+          <button type="submit" class="primary">Send</button>
+        </form>
+      </section>
+
       <section class="panel feed">
         <div class="feed-header">
           <h2>For You Feed</h2>
-          <small id="feed-meta">0 posts</small>
+          <div class="feed-tools">
+            <select id="agent-pov"></select>
+            <button id="refresh-feed-view" type="button">Refresh</button>
+            <small id="feed-meta">0 posts</small>
+          </div>
         </div>
         <div id="feed-list" class="feed-list"></div>
       </section>
@@ -112,7 +128,7 @@
     </main>
 
     <div id="post-modal" class="modal hidden" aria-hidden="true">
-      <div class="modal-card">
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-author">
         <div class="modal-actions">
           <button id="refresh-modal-image" type="button">Refresh Image</button>
           <button id="close-modal" class="close-btn" type="button">Close</button>
@@ -134,7 +150,7 @@
       <ul id="image-error-list" class="image-error-list"></ul>
     </section>
 
-    <section class="panel image-errors-panel">
+    <section class="panel image-errors-panel runtime-panel">
       <div class="feed-header">
         <h2>Runtime Guardian</h2>
         <small id="guardian-state">Monitoring active</small>
