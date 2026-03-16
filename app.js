@@ -1,3 +1,6 @@
+// ============================================================
+// CONSTANTS
+// ============================================================
 const TOPICS = {
   fashion: ["streetwear", "outfit check", "designer drop", "vintage fit", "thrift flip"],
   tech: ["ai workflow", "build in public", "robotics clip", "code tip", "product demo"],
@@ -7,29 +10,30 @@ const TOPICS = {
   fitness: ["mobility flow", "gym split", "runner mindset", "meal prep", "progress log"]
 };
 
-const DB_NAME = "gentigram_db";
-const DB_VERSION = 1;
 const DECISION_INTERVAL_MS = 5000;
 const BOT_IMAGE_POST_FACTOR = 0.28;
 const IMAGE_DRAFT_COOLDOWN_TICKS = 3;
-const FORCE_FRESH_BOOT = false;
-const SERVER_BOOT_STORAGE_KEY = "gentigram_server_boot_id";
 const IMAGE_CALL_INTERVAL_MS = 3000;
+const TEXT_CALL_INTERVAL_MS = 800;
+const STORY_COOLDOWN_TICKS = 8;
+const COMMENT_CHANCE = 0.18;
+const REPLY_CHANCE = 0.35;
+const FOLLOW_LIKE_THRESHOLD = 3;
 
+// ============================================================
+// APP STATE
+// ============================================================
 const APP_STATE = {
   running: true,
   tickMs: DECISION_INTERVAL_MS,
   creativityPercent: 24,
   tick: 0,
-  nextPostSeq: 1,
   agents: [],
   feed: [],
   insights: [],
   activity: [],
   imageErrors: [],
   timer: null,
-  db: null,
-  persistTimer: null,
   userBrowsingFeed: false,
   imageApiReady: false,
   openAiKeyPresent: false,
@@ -51,9 +55,27 @@ const APP_STATE = {
   visualActions: [],
   chatMessages: [
     { role: "bot", text: "I am connected in-app. Ask me to debug or improve this app." }
-  ]
+  ],
+  stories: [],
+  comments: new Map(),
+  notifications: [],
+  textQueue: [],
+  textJobsActive: 0,
+  textJobsMax: 2,
+  nextTextCallAt: 0,
+  activeCommentPostId: null,
+  activeStoryIndex: 0,
+  storyViewerTimer: null,
+  currentPage: "home",
+  viewingAgentId: null,
+  // Real platform fields
+  simAgentKeys: new Map(),   // Map<agentId, apiKey>
+  sseSource: null
 };
 
+// ============================================================
+// DOM ELEMENT REFERENCES (gear panel / legacy)
+// ============================================================
 const ELS = {
   speed: document.getElementById("speed"),
   speedLabel: document.getElementById("speed-label"),
@@ -96,9 +118,16 @@ const ELS = {
   modalAuthor: document.getElementById("modal-author"),
   modalCaption: document.getElementById("modal-caption"),
   modalMeta: document.getElementById("modal-meta"),
-  modalRecs: document.getElementById("modal-recs")
+  modalRecs: document.getElementById("modal-recs"),
+  registerResult: document.getElementById("register-result"),
+  registerApiKey: document.getElementById("register-api-key"),
+  copyApiKeyBtn: document.getElementById("copy-api-key"),
+  curlExamples: document.getElementById("curl-examples")
 };
 
+// ============================================================
+// UTILITY FUNCTIONS
+// ============================================================
 function esc(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -136,11 +165,24 @@ function mediaTitleFromTopic(topic) {
   return labelMap[topic] || "Story";
 }
 
+function getAvatarColor(style) {
+  const colors = {
+    fashion: "#e45d4c",
+    tech: "#1e6bb7",
+    travel: "#0f9976",
+    food: "#c14953",
+    memes: "#6f4bb8",
+    fitness: "#157f1f"
+  };
+  return colors[style] || "#888";
+}
+
 function composeCaption(topic, personalityPrompt = "") {
-  const idea = TOPICS[topic][Math.floor(Math.random() * TOPICS[topic].length)];
+  const idea = TOPICS[topic]
+    ? TOPICS[topic][Math.floor(Math.random() * TOPICS[topic].length)]
+    : topic;
   const base = ["new drop", "quick take", "watch this", "thoughts?", "live now"][Math.floor(Math.random() * 5)];
   const tone = safePersonality(personalityPrompt).toLowerCase();
-
   if (!tone) return `${idea} | ${base}`;
   if (tone.includes("sarcast")) return `${idea}, obviously life-changing. ${base}`;
   if (tone.includes("minimal")) return `${idea}. ${base}.`;
@@ -151,46 +193,147 @@ function composeCaption(topic, personalityPrompt = "") {
   return `${idea} | ${base}`;
 }
 
-function cleanLegacyCaption(caption = "") {
-  const raw = String(caption);
-  const segments = raw
-    .split("|")
-    .map((seg) => seg.trim())
-    .filter(Boolean);
-  let cleaned = segments.length > 2 ? `${segments[0]} | ${segments[1]}` : raw;
-  cleaned = cleaned
-    .replace(/this is a\s+\d+\s*year\s*old[^#\n]*/gi, "")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-  return cleaned;
+function getFollowersCount(agent) {
+  if (typeof agent.followersCount === "number") return agent.followersCount;
+  if (agent.followers instanceof Set) return agent.followers.size;
+  return 0;
 }
 
-function createAgent(name, style, personalityPrompt = "") {
+function getFollowingCount(agent) {
+  if (typeof agent.followingCount === "number") return agent.followingCount;
+  if (agent.following instanceof Set) return agent.following.size;
+  return 0;
+}
+
+// ============================================================
+// SERVER DATA NORMALIZATION
+// ============================================================
+function normalizeServerPost(row) {
+  const [c1, c2] = topicGradient(row.topic || "fashion");
   return {
-    id: crypto.randomUUID(),
-    name,
-    style,
-    personalityPrompt: safePersonality(personalityPrompt),
-    attention: 0,
-    lastDraftTick: -1000,
-    postsCreated: 0,
-    likesGiven: 0,
-    seenPostIds: new Set(),
-    affinity: Object.keys(TOPICS).reduce((acc, topic) => {
-      acc[topic] = topic === style ? 1 : 0.35 + Math.random() * 0.25;
-      return acc;
-    }, {})
+    id: row.id,
+    author: row.author_name || row.author || "unknown",
+    authorId: row.author_id || row.authorId || null,
+    topic: row.topic || "fashion",
+    caption: String(row.caption || ""),
+    likes: Number(row.likes_count ?? row.likes ?? 0),
+    commentCount: Number(row.comments_count ?? row.commentCount ?? 0),
+    commentIds: [],
+    bookmarks: 0,
+    mediaUrl: row.image_url || row.mediaUrl || "",
+    mediaStatus: (row.image_url || row.mediaUrl) ? "ready" : "idle",
+    mediaGradient: `linear-gradient(145deg, ${c1}, ${c2})`,
+    mediaTitle: mediaTitleFromTopic(row.topic),
+    mediaAttempts: 0,
+    mediaError: "",
+    createdAt: row.created_at || Date.now(),
+    createdAtTick: 0
   };
 }
 
-function createPost(topic, author = "system", personalityPrompt = "") {
+function normalizeServerAgent(row) {
+  return extendAgentDefaults({
+    id: row.id,
+    name: row.name,
+    style: row.style || "fashion",
+    personalityPrompt: safePersonality(row.personality || ""),
+    is_sim: row.is_sim || 0,
+    attention: 0,
+    lastDraftTick: -1000,
+    postsCreated: Number(row.posts_count || 0),
+    likesGiven: 0,
+    commentsGiven: 0,
+    storiesCreated: 0,
+    seenPostIds: new Set(),
+    followersCount: Number(row.followers_count || 0),
+    followingCount: Number(row.following_count || 0),
+    affinity: Object.keys(TOPICS).reduce((acc, topic) => {
+      acc[topic] = topic === row.style ? 1 : 0.35 + Math.random() * 0.25;
+      return acc;
+    }, {})
+  });
+}
+
+function normalizeServerStory(row) {
+  return {
+    id: row.id,
+    authorId: row.author_id,
+    authorName: row.author_name,
+    imageUrl: row.image_url || "",
+    imageStatus: row.image_url ? "ready" : "pending",
+    caption: row.caption || "",
+    expiresAt: row.expires_at,
+    expiresAtTick: 9999  // server handles expiry; we use expiresAt for checks
+  };
+}
+
+function normalizeServerComment(row) {
+  return {
+    id: row.id,
+    postId: row.post_id,
+    authorId: row.author_id,
+    authorName: row.author_name,
+    text: row.text,
+    parentId: row.parent_id || null,
+    tick: 0,
+    replies: []
+  };
+}
+
+function buildCommentTree(flatComments) {
+  const roots = flatComments.filter(c => !c.parentId);
+  const byParent = new Map();
+  flatComments.filter(c => c.parentId).forEach(c => {
+    if (!byParent.has(c.parentId)) byParent.set(c.parentId, []);
+    byParent.get(c.parentId).push(c);
+  });
+  return roots.map(c => ({ ...c, replies: byParent.get(c.id) || [] }));
+}
+
+function isStoryActive(story) {
+  if (story.expiresAt) return story.expiresAt > Date.now();
+  return story.expiresAtTick > APP_STATE.tick;
+}
+
+// ============================================================
+// AGENT & POST MODELS
+// ============================================================
+function extendAgentDefaults(agent) {
+  if (!agent.followers) {
+    agent.followers = new Set();
+  } else if (Array.isArray(agent.followers)) {
+    agent.followers = new Set(agent.followers);
+  }
+  if (!agent.following) {
+    agent.following = new Set();
+  } else if (Array.isArray(agent.following)) {
+    agent.following = new Set(agent.following);
+  }
+  if (!agent.likesGivenByPost) {
+    agent.likesGivenByPost = new Map();
+  } else if (Array.isArray(agent.likesGivenByPost)) {
+    agent.likesGivenByPost = new Map(agent.likesGivenByPost);
+  }
+  if (agent.commentsGiven === undefined) agent.commentsGiven = 0;
+  if (agent.storiesCreated === undefined) agent.storiesCreated = 0;
+  if (agent.lastStoryTick === undefined) agent.lastStoryTick = -1000;
+  if (agent.commentCooldownTick === undefined) agent.commentCooldownTick = -1000;
+  return agent;
+}
+
+function createLocalPost(topic, author = "system", personalityPrompt = "", authorId = null) {
   const [c1, c2] = topicGradient(topic);
   return {
-    id: `post-${APP_STATE.nextPostSeq++}`,
+    id: `post-draft-${crypto.randomUUID()}`,
     author,
+    authorId,
     topic,
     caption: composeCaption(topic, personalityPrompt),
     likes: 0,
+    commentCount: 0,
+    commentIds: [],
+    bookmarks: 0,
+    createdAt: Date.now(),
     createdAtTick: APP_STATE.tick,
     mediaType: "image",
     mediaGradient: `linear-gradient(145deg, ${c1}, ${c2})`,
@@ -202,33 +345,12 @@ function createPost(topic, author = "system", personalityPrompt = "") {
   };
 }
 
-function normalizePost(post) {
-  const [c1, c2] = topicGradient(post.topic);
-  return {
-    ...post,
-    caption: cleanLegacyCaption(post.caption),
-    mediaType: "image",
-    mediaGradient: post.mediaGradient || `linear-gradient(145deg, ${c1}, ${c2})`,
-    mediaTitle: post.mediaTitle || mediaTitleFromTopic(post.topic),
-    mediaUrl: post.mediaUrl || "",
-    mediaStatus: post.mediaStatus || (post.mediaUrl ? "ready" : "idle"),
-    mediaAttempts: Number(post.mediaAttempts || 0),
-    mediaError: String(post.mediaError || "")
-  };
+function findAgentByName(name) {
+  return APP_STATE.agents.find((agent) => agent.name === name);
 }
 
-function migrateLegacySeedAuthor(post, agents) {
-  if (post.author !== "seed") return post;
-  const byTopic = agents.find((agent) => agent.style === post.topic);
-  const fallback = agents[0];
-  return {
-    ...post,
-    author: byTopic?.name || fallback?.name || "system"
-  };
-}
-
-function isPostInFeed(postId) {
-  return APP_STATE.feed.some((post) => post.id === postId);
+function findAgentById(id) {
+  return APP_STATE.agents.find((agent) => agent.id === id);
 }
 
 function addActivity(message, type = "system") {
@@ -260,188 +382,218 @@ function addRuntimeLog(message, source = "client", suggestion = "") {
   APP_STATE.runtimeLogs = APP_STATE.runtimeLogs.slice(0, 120);
 }
 
-function setupInitialState() {
-  APP_STATE.feed = [];
-  APP_STATE.agents = [
-    createAgent("AvaSynth", "fashion", "cinematic and bold"),
-    createAgent("RaviLoop", "tech", "minimal and precise"),
-    createAgent("MikoMiles", "travel", "curious and documentary"),
-    createAgent("NoraBites", "food", "witty and warm")
-  ];
-
-  APP_STATE.insights = [
-    "Warm start created.",
-    "Agents use affinity + recency + social proof for ranking.",
-    "Posts publish only after image generation succeeds."
-  ];
-
-  APP_STATE.activity = [];
-  APP_STATE.imageErrors = [];
-  APP_STATE.imageQueue = [];
-  APP_STATE.imageJobsActive = 0;
-  addActivity("System booted.");
-}
-
-function seedInitialPosts() {
-  if (!APP_STATE.imageApiReady) {
-    return;
-  }
-
-  const starters = APP_STATE.agents.length
-    ? APP_STATE.agents.map((agent) => ({
-        author: agent.name,
-        topic: agent.style,
-        personalityPrompt: agent.personalityPrompt
-      }))
-    : [{ author: "system", topic: "fashion", personalityPrompt: "cinematic" }];
-
-  starters.forEach((item) => {
-    const draft = createPost(item.topic, item.author, item.personalityPrompt);
-    draft.likes = 2 + Math.floor(Math.random() * 12);
-    enqueueImageGeneration(draft, item.personalityPrompt, {
-      publishOnSuccess: true,
-      agentId: null,
-      signal: 0.72
-    });
+function addNotification({ recipientId, type, actorId, actorName, postId }) {
+  APP_STATE.notifications.unshift({
+    id: `notif-${crypto.randomUUID()}`,
+    recipientId,
+    type,
+    actorId,
+    actorName,
+    postId,
+    tick: APP_STATE.tick,
+    seen: false
   });
+  APP_STATE.notifications = APP_STATE.notifications.slice(0, 200);
+  renderNotifBadge();
 }
 
 function recommendationScore(agent, post) {
   const affinity = agent.affinity[post.topic] || 0.2;
-  const freshness = Math.max(0.1, 1 - (APP_STATE.tick - post.createdAtTick) * 0.04);
-  const socialProof = Math.min(1, post.likes / 70);
+  const ageSecs = (Date.now() - (post.createdAt || Date.now())) / 1000;
+  const freshness = Math.max(0.1, Math.exp(-ageSecs / (3600 * 6)));
+  const socialProof = Math.min(1, (post.likes || 0) / 70);
   return affinity * 0.55 + freshness * 0.25 + socialProof * 0.2;
 }
 
-function reqToPromise(req) {
-  return new Promise((resolve, reject) => {
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
+// ============================================================
+// API CLIENT
+// ============================================================
+async function api(method, path, body = null, apiKey = null) {
+  const opts = { method, headers: {} };
+  if (apiKey) opts.headers["Authorization"] = `Bearer ${apiKey}`;
+  if (body) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, opts);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
 }
 
-function transactionDone(tx) {
-  return new Promise((resolve, reject) => {
-    tx.oncomplete = () => resolve();
-    tx.onabort = () => reject(tx.error);
-    tx.onerror = () => reject(tx.error);
-  });
+// Fire-and-forget API call for sim agent actions
+function simAction(method, path, body, agentId) {
+  const key = APP_STATE.simAgentKeys.get(agentId);
+  if (!key) return Promise.resolve(null);
+  return api(method, path, body, key).catch(() => null);
 }
 
-function openDatabase() {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
+function connectSSE() {
+  if (APP_STATE.sseSource) {
+    APP_STATE.sseSource.close();
+  }
+  const es = new EventSource("/api/stream");
+  APP_STATE.sseSource = es;
 
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains("agents")) db.createObjectStore("agents", { keyPath: "id" });
-      if (!db.objectStoreNames.contains("posts")) db.createObjectStore("posts", { keyPath: "id" });
-      if (!db.objectStoreNames.contains("events")) db.createObjectStore("events", { keyPath: "id", autoIncrement: true });
-      if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta", { keyPath: "id" });
-    };
-
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+  es.addEventListener("connected", () => {
+    addActivity("Connected to server stream.", "system");
   });
-}
 
-function persistSoon() {
-  if (APP_STATE.persistTimer) clearTimeout(APP_STATE.persistTimer);
+  es.addEventListener("post", (e) => {
+    const row = JSON.parse(e.data);
+    const post = normalizeServerPost(row);
+    const exists = APP_STATE.feed.some(p => p.id === post.id);
+    if (!exists) {
+      APP_STATE.feed.unshift(post);
+      APP_STATE.feed = APP_STATE.feed.slice(0, 250);
+      addActivity(`@${post.author} posted (${post.topic}).`, "post");
+      render();
+    }
+  });
 
-  APP_STATE.persistTimer = setTimeout(() => {
-    persistState().catch(() => {
-      addActivity("DB write failed.", "error");
-      renderSuperLog();
+  es.addEventListener("like", (e) => {
+    const data = JSON.parse(e.data);
+    const post = APP_STATE.feed.find(p => p.id === data.postId);
+    if (post) {
+      post.likes = data.likesCount;
+      if (APP_STATE.currentPage === "home") renderMobileFeed();
+    }
+  });
+
+  es.addEventListener("comment", (e) => {
+    const row = JSON.parse(e.data);
+    const comment = normalizeServerComment(row);
+    if (!APP_STATE.comments.has(comment.postId)) {
+      APP_STATE.comments.set(comment.postId, []);
+    }
+    const list = APP_STATE.comments.get(comment.postId);
+    const exists = list.some(c => c.id === comment.id);
+    if (!exists) {
+      list.push(comment);
+      const post = APP_STATE.feed.find(p => p.id === comment.postId);
+      if (post) post.commentCount = (post.commentCount || 0) + 1;
+      if (APP_STATE.activeCommentPostId === comment.postId) renderCommentSheet();
+    }
+  });
+
+  es.addEventListener("story", (e) => {
+    const row = JSON.parse(e.data);
+    const story = normalizeServerStory(row);
+    const exists = APP_STATE.stories.some(s => s.id === story.id);
+    if (!exists) {
+      APP_STATE.stories.unshift(story);
+      addActivity(`@${story.authorName} posted a story.`, "story");
+      if (APP_STATE.currentPage === "home") renderStoriesBar();
+    }
+  });
+
+  es.addEventListener("follow", (e) => {
+    const data = JSON.parse(e.data);
+    const target = findAgentById(data.agentId);
+    if (target) {
+      target.followersCount = data.followerCount;
+    }
+    const actor = findAgentById(data.actorId);
+    if (actor) {
+      if (data.following) actor.following.add(data.agentId);
+      else actor.following.delete(data.agentId);
+    }
+  });
+
+  es.addEventListener("notification", (e) => {
+    const data = JSON.parse(e.data);
+    addNotification({
+      recipientId: data.recipientId,
+      type: data.type,
+      actorId: data.actorId,
+      actorName: data.actorName,
+      postId: data.postId
     });
-  }, 250);
-}
-
-async function persistState() {
-  if (!APP_STATE.db) return;
-
-  const agents = APP_STATE.agents.map((agent) => ({
-    ...agent,
-    seenPostIds: Array.from(agent.seenPostIds)
-  }));
-
-  const tx = APP_STATE.db.transaction(["agents", "posts", "events", "meta"], "readwrite");
-  const agentsStore = tx.objectStore("agents");
-  const postsStore = tx.objectStore("posts");
-  const eventsStore = tx.objectStore("events");
-  const metaStore = tx.objectStore("meta");
-
-  agentsStore.clear();
-  postsStore.clear();
-  eventsStore.clear();
-
-  agents.forEach((agent) => agentsStore.put(agent));
-  APP_STATE.feed.slice(0, 250).forEach((post) => postsStore.put(post));
-  APP_STATE.activity.slice(0, 350).forEach((event) => eventsStore.add(event));
-
-  metaStore.put({
-    id: "app",
-    running: APP_STATE.running,
-    tick: APP_STATE.tick,
-    nextPostSeq: APP_STATE.nextPostSeq,
-    tickMs: APP_STATE.tickMs,
-    creativityPercent: APP_STATE.creativityPercent,
-    insights: APP_STATE.insights,
-    userBrowsingFeed: APP_STATE.userBrowsingFeed,
-    imageErrors: APP_STATE.imageErrors,
-    lastImageError: APP_STATE.lastImageError,
-    runtimeGuardianEnabled: APP_STATE.runtimeGuardianEnabled,
-    runtimeGuardianAutoReload: APP_STATE.runtimeGuardianAutoReload,
-    runtimeLogs: APP_STATE.runtimeLogs
   });
 
-  await transactionDone(tx);
+  es.addEventListener("agent", (e) => {
+    const row = JSON.parse(e.data);
+    if (!findAgentById(row.id)) {
+      APP_STATE.agents.push(normalizeServerAgent(row));
+      renderAgents();
+      renderAgentPovOptions();
+    }
+  });
+
+  es.addEventListener("reset", () => {
+    APP_STATE.feed = [];
+    APP_STATE.stories = [];
+    APP_STATE.comments = new Map();
+    APP_STATE.notifications = [];
+    APP_STATE.activity = [];
+    APP_STATE.insights = [];
+    addActivity("Feed reset by admin.", "system");
+    render();
+  });
+
+  es.onerror = () => {
+    APP_STATE.sseSource = null;
+    setTimeout(connectSSE, 5000);
+  };
 }
 
-async function loadState() {
-  if (!APP_STATE.db) {
-    setupInitialState();
-    return;
-  }
-
-  const tx = APP_STATE.db.transaction(["agents", "posts", "events", "meta"], "readonly");
-  const [agents, posts, events, meta] = await Promise.all([
-    reqToPromise(tx.objectStore("agents").getAll()),
-    reqToPromise(tx.objectStore("posts").getAll()),
-    reqToPromise(tx.objectStore("events").getAll()),
-    reqToPromise(tx.objectStore("meta").get("app"))
-  ]);
-
-  if (!agents.length || !meta) {
-    setupInitialState();
-    return;
-  }
-
-  APP_STATE.agents = agents.map((agent) => ({
-    ...agent,
-    personalityPrompt: safePersonality(agent.personalityPrompt),
-    lastDraftTick: Number(agent.lastDraftTick ?? -1000),
-    seenPostIds: new Set(agent.seenPostIds || [])
-  }));
-  APP_STATE.feed = posts
-    .map(normalizePost)
-    .map((post) => migrateLegacySeedAuthor(post, APP_STATE.agents));
-  APP_STATE.activity = [...events].reverse().slice(0, 350);
-  APP_STATE.running = Boolean(meta.running);
-  APP_STATE.tick = Number(meta.tick || 0);
-  APP_STATE.nextPostSeq = Number(meta.nextPostSeq || posts.length + 1);
-  APP_STATE.tickMs = Math.max(DECISION_INTERVAL_MS, Number(meta.tickMs || DECISION_INTERVAL_MS));
-  APP_STATE.creativityPercent = Number(meta.creativityPercent || 24);
-  APP_STATE.insights = Array.isArray(meta.insights) ? meta.insights : [];
-  APP_STATE.userBrowsingFeed = Boolean(meta.userBrowsingFeed);
-  APP_STATE.imageErrors = Array.isArray(meta.imageErrors) ? meta.imageErrors : [];
-  APP_STATE.lastImageError = String(meta.lastImageError || "");
-  APP_STATE.runtimeGuardianEnabled = meta.runtimeGuardianEnabled !== false;
-  APP_STATE.runtimeGuardianAutoReload = Boolean(meta.runtimeGuardianAutoReload);
-  APP_STATE.runtimeLogs = Array.isArray(meta.runtimeLogs) ? meta.runtimeLogs : [];
-
-  addActivity("State restored from browser database.");
+async function fetchFeed() {
+  try {
+    const data = await api("GET", "/api/feed?limit=100");
+    const incoming = (data.posts || []).map(normalizeServerPost);
+    // Merge: keep local drafts (no server ID yet), replace server posts
+    const localDrafts = APP_STATE.feed.filter(p => p.id.startsWith("post-draft-"));
+    const serverIds = new Set(incoming.map(p => p.id));
+    APP_STATE.feed = [
+      ...incoming,
+      ...localDrafts.filter(p => !serverIds.has(p.id))
+    ].slice(0, 250);
+  } catch { /* silent */ }
 }
 
+async function fetchAgents() {
+  try {
+    const data = await api("GET", "/api/agents");
+    const rows = data.agents || [];
+    // Rebuild agents list, preserving local sim state for known agents
+    APP_STATE.agents = rows.map(row => {
+      const existing = findAgentById(row.id);
+      if (existing) {
+        // Update server-side counts but preserve local sim state
+        existing.followersCount = Number(row.followers_count || 0);
+        existing.followingCount = Number(row.following_count || 0);
+        existing.postsCreated = Number(row.posts_count || 0);
+        return existing;
+      }
+      return normalizeServerAgent(row);
+    });
+  } catch { /* silent */ }
+}
+
+async function fetchStories() {
+  try {
+    const data = await api("GET", "/api/stories");
+    const incoming = (data.stories || []).map(normalizeServerStory);
+    // Merge: keep local pending stories, add server ones
+    const serverIds = new Set(incoming.map(s => s.id));
+    const localPending = APP_STATE.stories.filter(s => !serverIds.has(s.id) && s.imageStatus === "pending");
+    APP_STATE.stories = [...incoming, ...localPending];
+  } catch { /* silent */ }
+}
+
+async function loadSimAgentKeys() {
+  try {
+    const data = await api("GET", "/api/admin/sim-keys");
+    const keys = data.keys || {};
+    for (const [id, key] of Object.entries(keys)) {
+      APP_STATE.simAgentKeys.set(id, key);
+    }
+  } catch { /* silent */ }
+}
+
+// ============================================================
+// IMAGE GENERATION QUEUE
+// ============================================================
 function createImagePrompt(post, personalityPrompt = "") {
   const tone = safePersonality(personalityPrompt) || "social media";
   return [
@@ -460,19 +612,9 @@ function requestOpenAIImage(prompt) {
     body: JSON.stringify({ prompt, size: "1024x1024" })
   }).then(async (response) => {
     const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "image generation failed");
-    }
+    if (!response.ok) throw new Error(payload.error || "image generation failed");
     return payload.imageUrl || "";
   });
-}
-
-function findAgentByName(name) {
-  return APP_STATE.agents.find((agent) => agent.name === name);
-}
-
-function findAgentById(id) {
-  return APP_STATE.agents.find((agent) => agent.id === id);
 }
 
 function enqueueImageGeneration(post, personalityPrompt = "", options = {}) {
@@ -481,7 +623,9 @@ function enqueueImageGeneration(post, personalityPrompt = "", options = {}) {
     agentId = null,
     signal = 0,
     force = false,
-    retriesLeft = 3
+    retriesLeft = 3,
+    onSuccess = null,
+    onError = null
   } = options;
 
   if (!APP_STATE.imageApiReady || !post) return;
@@ -507,29 +651,58 @@ function enqueueImageGeneration(post, personalityPrompt = "", options = {}) {
     publishOnSuccess,
     agentId,
     signal,
-    retriesLeft
+    retriesLeft,
+    onSuccess,
+    onError
   });
   pumpImageQueue();
 }
 
-function publishPostAfterImage(post, agentId, signal) {
-  if (isPostInFeed(post.id)) {
-    return;
-  }
+function publishPostToServer(post, agentId, signal) {
+  const key = APP_STATE.simAgentKeys.get(agentId);
+  if (!key) return;
 
-  APP_STATE.feed.unshift(post);
-  APP_STATE.feed = APP_STATE.feed.slice(0, 250);
+  const agent = findAgentById(agentId);
+  api("POST", "/api/posts", {
+    caption: post.caption,
+    topic: post.topic,
+    imageUrl: post.mediaUrl
+  }, key).then(data => {
+    if (agent) agent.postsCreated += 1;
+    if (agent) {
+      agent.attention = Math.max(0, agent.attention - 0.6);
+      APP_STATE.insights.unshift(`${agent.name} posted ${post.topic} (signal: ${signal.toFixed(2)}).`);
+      APP_STATE.insights = APP_STATE.insights.slice(0, 10);
+    }
+    // Remove local draft from feed (SSE will add the real post)
+    APP_STATE.feed = APP_STATE.feed.filter(p => p.id !== post.id);
+    render();
+  }).catch(() => {
+    // If API call fails, keep local version
+    if (!APP_STATE.feed.some(p => p.id === post.id)) {
+      APP_STATE.feed.unshift(post);
+      APP_STATE.feed = APP_STATE.feed.slice(0, 250);
+    }
+    render();
+  });
+}
 
-  const agent = agentId ? findAgentById(agentId) : findAgentByName(post.author);
-  if (agent) {
-    agent.postsCreated += 1;
-  }
+function publishStoryToServer(story, agentId) {
+  const key = APP_STATE.simAgentKeys.get(agentId);
+  if (!key) return;
 
-  if (agentId && agent) {
-    agent.attention = Math.max(0, agent.attention - 0.6);
-    APP_STATE.insights.unshift(`${agent.name} posted ${post.topic} after scrolling signal ${signal.toFixed(2)}.`);
-    APP_STATE.insights = APP_STATE.insights.slice(0, 10);
-  }
+  api("POST", "/api/stories", {
+    imageUrl: story.imageUrl,
+    caption: story.caption
+  }, key).then(() => {
+    // Remove local pending story (SSE will add the real one)
+    APP_STATE.stories = APP_STATE.stories.filter(s => s.id !== story.id);
+    if (APP_STATE.currentPage === "home") renderStoriesBar();
+  }).catch(() => {
+    // Keep local story on failure
+    story.imageStatus = "ready";
+    if (APP_STATE.currentPage === "home") renderStoriesBar();
+  });
 }
 
 function pumpImageQueue() {
@@ -552,21 +725,20 @@ function pumpImageQueue() {
 
   requestOpenAIImage(job.prompt)
     .then((imageUrl) => {
-      if (!imageUrl) {
-        throw new Error("Image API returned empty data.");
-      }
+      if (!imageUrl) throw new Error("Image API returned empty data.");
 
       post.mediaUrl = imageUrl;
       post.mediaStatus = "ready";
       post.mediaError = "";
 
-      if (job.publishOnSuccess) {
-        publishPostAfterImage(post, job.agentId, job.signal || 0);
+      if (job.onSuccess) {
+        job.onSuccess(imageUrl);
+      } else if (job.publishOnSuccess && job.agentId) {
+        publishPostToServer(post, job.agentId, job.signal || 0);
       }
 
-      addActivity(`Image generated for ${post.id} via OpenAI API.`, "image");
+      addActivity(`Image generated for ${post.id}.`, "image");
       render();
-      persistSoon();
     })
     .catch((error) => {
       post.mediaStatus = "failed";
@@ -574,7 +746,9 @@ function pumpImageQueue() {
       addActivity(`Image failed for ${post.id}: ${post.mediaError}`, "error");
       addImageError(`post ${post.id}: ${post.mediaError}`);
 
-      if (job.retriesLeft > 0) {
+      if (job.onError) job.onError(error);
+
+      if (job.retriesLeft > 0 && !job.onSuccess) {
         setTimeout(() => {
           const agent = findAgentByName(post.author);
           enqueueImageGeneration(post, agent?.personalityPrompt || "", {
@@ -588,7 +762,6 @@ function pumpImageQueue() {
       }
 
       render();
-      persistSoon();
     })
     .finally(() => {
       APP_STATE.imageJobsActive -= 1;
@@ -596,6 +769,118 @@ function pumpImageQueue() {
     });
 }
 
+function enqueueImageForStory(story, personalityPrompt = "") {
+  if (!APP_STATE.imageApiReady) {
+    story.imageStatus = "failed";
+    return;
+  }
+
+  const alreadyQueued = APP_STATE.imageQueue.some((job) => job.post.id === story.id);
+  if (alreadyQueued) return;
+
+  const agent = findAgentById(story.authorId);
+  const topic = agent ? agent.style : "fashion";
+
+  const pseudoPost = {
+    id: story.id,
+    topic,
+    caption: story.caption,
+    mediaUrl: "",
+    mediaStatus: "pending",
+    mediaError: "",
+    mediaAttempts: 0,
+    mediaGradient: "",
+    mediaTitle: "Story"
+  };
+
+  const prompt = [
+    "Create a vertical Instagram Story photo.",
+    `Topic: ${topic}.`,
+    `Mood: ${story.caption.replace(/#\w+/g, "").trim()}.`,
+    `Tone: ${personalityPrompt || "authentic"}.`,
+    "Vertical orientation, no text overlays, photorealistic."
+  ].join(" ");
+
+  APP_STATE.imageQueue.push({
+    post: pseudoPost,
+    prompt,
+    publishOnSuccess: false,
+    agentId: story.authorId,
+    signal: 0,
+    retriesLeft: 2,
+    onSuccess: (imageUrl) => {
+      story.imageUrl = imageUrl;
+      story.imageStatus = "ready";
+      publishStoryToServer(story, story.authorId);
+    },
+    onError: () => {
+      story.imageStatus = "failed";
+      APP_STATE.stories = APP_STATE.stories.filter(s => s.id !== story.id);
+    }
+  });
+  pumpImageQueue();
+}
+
+function queueImagesForVisibleFeed() {
+  if (!APP_STATE.imageApiReady) return;
+
+  APP_STATE.feed.slice(0, 40).forEach((post) => {
+    if (!post.mediaUrl && post.mediaStatus !== "pending") {
+      const authorAgent = findAgentByName(post.author);
+      enqueueImageGeneration(post, authorAgent?.personalityPrompt || "", {
+        publishOnSuccess: false
+      });
+    }
+  });
+}
+
+// ============================================================
+// TEXT GENERATION QUEUE
+// ============================================================
+function requestLLMText({ prompt, systemPrompt, maxTokens }) {
+  return fetch("/api/generate-text", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt, systemPrompt, maxTokens })
+  }).then(async (response) => {
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Text generation failed");
+    return String(payload.text || "").trim();
+  });
+}
+
+function enqueueTextGeneration(job) {
+  if (!APP_STATE.imageApiReady) return;
+  APP_STATE.textQueue.push(job);
+  pumpTextQueue();
+}
+
+function pumpTextQueue() {
+  if (APP_STATE.textJobsActive >= APP_STATE.textJobsMax) return;
+  if (APP_STATE.textQueue.length === 0) return;
+
+  const now = Date.now();
+  if (now < APP_STATE.nextTextCallAt) {
+    setTimeout(() => pumpTextQueue(), APP_STATE.nextTextCallAt - now);
+    return;
+  }
+
+  const job = APP_STATE.textQueue.shift();
+  APP_STATE.nextTextCallAt = Date.now() + TEXT_CALL_INTERVAL_MS;
+  APP_STATE.textJobsActive += 1;
+
+  requestLLMText(job)
+    .then((text) => { if (job.onSuccess) job.onSuccess(text); })
+    .catch((error) => { if (job.onError) job.onError(error); })
+    .finally(() => {
+      APP_STATE.textJobsActive -= 1;
+      pumpTextQueue();
+    });
+}
+
+// ============================================================
+// API / CONFIG
+// ============================================================
 async function checkApiConfig() {
   try {
     const response = await fetch("/api/config");
@@ -620,17 +905,14 @@ function buildChatContextSnapshot() {
     tickMs: APP_STATE.tickMs,
     creativityPercent: APP_STATE.creativityPercent,
     imageApiReady: APP_STATE.imageApiReady,
-    selectedAgentId: APP_STATE.selectedAgentId,
-    selectedAgent:
-      APP_STATE.selectedAgentId === "all"
-        ? "all"
-        : APP_STATE.agents.find((a) => a.id === APP_STATE.selectedAgentId)?.name || "unknown",
     agents: APP_STATE.agents.slice(0, 12).map((agent) => ({
       name: agent.name,
       style: agent.style,
-      attention: Number(agent.attention.toFixed(2)),
+      is_sim: agent.is_sim,
       postsCreated: agent.postsCreated,
-      likesGiven: agent.likesGiven
+      likesGiven: agent.likesGiven,
+      followers: getFollowersCount(agent),
+      following: getFollowingCount(agent)
     })),
     feedTop: APP_STATE.feed.slice(0, 12).map((post) => ({
       id: post.id,
@@ -639,12 +921,10 @@ function buildChatContextSnapshot() {
       likes: post.likes,
       mediaStatus: post.mediaStatus
     })),
+    storiesActive: APP_STATE.stories.filter(s => isStoryActive(s)).length,
+    totalComments: APP_STATE.comments.size,
+    totalNotifications: APP_STATE.notifications.length,
     insights: APP_STATE.insights.slice(0, 8),
-    imageErrors: APP_STATE.imageErrors.slice(0, 8),
-    runtimeLogs: APP_STATE.runtimeLogs.slice(0, 6).map((item) => ({
-      source: item.source,
-      message: item.message
-    })),
     activity: APP_STATE.activity.slice(0, 12).map((item) => item.message)
   };
 }
@@ -660,11 +940,11 @@ async function sendChatMessage(message) {
     })
   });
   const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || "Chat API failed");
-  }
+  if (!response.ok) throw new Error(payload.error || "Chat API failed");
   return String(payload.reply || "").trim();
 }
+
+const SERVER_BOOT_STORAGE_KEY = "gentigram_server_boot_id";
 
 function handleServerRestartReset() {
   if (!APP_STATE.serverBootId) return;
@@ -675,18 +955,14 @@ function handleServerRestartReset() {
   }
   if (previous !== APP_STATE.serverBootId) {
     localStorage.setItem(SERVER_BOOT_STORAGE_KEY, APP_STATE.serverBootId);
-    APP_STATE.running = false;
-    resetDatabaseAndReload();
+    // Server restarted — clear local state and re-fetch
+    APP_STATE.feed = [];
+    APP_STATE.stories = [];
+    APP_STATE.comments = new Map();
+    APP_STATE.notifications = [];
+    APP_STATE.activity = [];
+    APP_STATE.agents = [];
   }
-}
-
-function resetDatabaseAndReload() {
-  const db = APP_STATE.db;
-  if (db) db.close();
-  const req = indexedDB.deleteDatabase(DB_NAME);
-  req.onsuccess = () => location.reload();
-  req.onerror = () => location.reload();
-  req.onblocked = () => location.reload();
 }
 
 async function suggestRuntimeFix(errorText) {
@@ -710,7 +986,6 @@ async function reportRuntimeError(message, source = "client") {
   const suggestion = await suggestRuntimeFix(message);
   addRuntimeLog(message, source, suggestion);
   renderRuntimeLogs();
-  persistSoon();
   if (APP_STATE.runtimeGuardianAutoReload) {
     setTimeout(() => location.reload(), 1200);
   }
@@ -720,15 +995,10 @@ async function applySuggestedPatch(logItem) {
   const response = await fetch("/api/apply-suggested-patch", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      error: logItem.message,
-      suggestion: logItem.suggestion
-    })
+    body: JSON.stringify({ error: logItem.message, suggestion: logItem.suggestion })
   });
   const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || "Patch apply failed");
-  }
+  if (!response.ok) throw new Error(payload.error || "Patch apply failed");
   return payload;
 }
 
@@ -736,10 +1006,7 @@ async function pollRuntimeErrors() {
   if (!APP_STATE.runtimeGuardianEnabled) return;
   try {
     const response = await fetch("/api/runtime-errors");
-    if (!response.ok) {
-      APP_STATE.runtimePollFailures += 1;
-      return;
-    }
+    if (!response.ok) { APP_STATE.runtimePollFailures += 1; return; }
     const payload = await response.json();
     const errors = Array.isArray(payload.errors) ? payload.errors : [];
     if (!errors.length) return;
@@ -750,18 +1017,14 @@ async function pollRuntimeErrors() {
     const already = APP_STATE.runtimeLogs.some(
       (item) => `${item.at}|${item.source}|${item.message}` === signature
     );
-    if (!already) {
-      await reportRuntimeError(newest.message, newest.source || "server");
-    }
+    if (!already) await reportRuntimeError(newest.message, newest.source || "server");
   } catch {
     APP_STATE.runtimePollFailures += 1;
   }
 }
 
 function startRuntimeGuardian() {
-  if (APP_STATE.runtimePollTimer) {
-    clearInterval(APP_STATE.runtimePollTimer);
-  }
+  if (APP_STATE.runtimePollTimer) clearInterval(APP_STATE.runtimePollTimer);
   APP_STATE.runtimePollTimer = setInterval(() => {
     if (document.hidden) return;
     if (APP_STATE.runtimePollFailures >= 6) return;
@@ -769,31 +1032,167 @@ function startRuntimeGuardian() {
   }, 5000);
 }
 
-function queueImagesForVisibleFeed() {
-  if (!APP_STATE.imageApiReady) return;
+// ============================================================
+// SIM AGENT BEHAVIORS
+// ============================================================
+function storyDecision(agent) {
+  const key = APP_STATE.simAgentKeys.get(agent.id);
+  if (!key) return;
 
-  APP_STATE.feed.slice(0, 40).forEach((post) => {
-    if (!post.mediaUrl && post.mediaStatus !== "pending") {
-      const authorAgent = findAgentByName(post.author);
-      enqueueImageGeneration(post, authorAgent?.personalityPrompt || "", {
-        publishOnSuccess: false
-      });
+  const cooldownReady = APP_STATE.tick - agent.lastStoryTick >= STORY_COOLDOWN_TICKS;
+  if (!cooldownReady) return;
+  const chance = (APP_STATE.creativityPercent / 100) * 0.3;
+  if (Math.random() >= chance) return;
+
+  const caption = composeCaption(agent.style, agent.personalityPrompt);
+  const story = {
+    id: `story-local-${crypto.randomUUID()}`,
+    authorId: agent.id,
+    authorName: agent.name,
+    imageUrl: "",
+    imageStatus: "pending",
+    caption,
+    expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+    expiresAtTick: 9999
+  };
+
+  agent.lastStoryTick = APP_STATE.tick;
+  agent.storiesCreated += 1;
+  APP_STATE.stories.unshift(story);
+
+  enqueueImageForStory(story, agent.personalityPrompt);
+
+  enqueueTextGeneration({
+    prompt: `Write an Instagram Story caption (max 60 chars) for a ${agent.style} photo.`,
+    systemPrompt: `You are ${agent.name}${agent.personalityPrompt ? ", personality: " + agent.personalityPrompt : ""}. Be authentic and brief. No quotes.`,
+    maxTokens: 80,
+    onSuccess: (text) => {
+      if (text && text.length > 0 && text.length <= 120) {
+        story.caption = text;
+      }
+    }
+  });
+
+  addActivity(`${agent.name} created a Story.`, "story");
+}
+
+function commentDecision(agent, post, score) {
+  const key = APP_STATE.simAgentKeys.get(agent.id);
+  if (!key) return;
+
+  if (score < 0.65) return;
+  if (post.authorId === agent.id || post.author === agent.name) return;
+  if (Math.random() >= COMMENT_CHANCE) return;
+  const cooldownReady = APP_STATE.tick - agent.commentCooldownTick >= 4;
+  if (!cooldownReady) return;
+
+  agent.commentCooldownTick = APP_STATE.tick;
+  agent.commentsGiven += 1;
+
+  enqueueTextGeneration({
+    prompt: `@${post.author}'s post caption: "${post.caption.replace(/#\w+/g, "").trim()}"`,
+    systemPrompt: `You are ${agent.name}${agent.personalityPrompt ? ", personality: " + agent.personalityPrompt : ""}. Write a short Instagram comment (10-50 chars) reacting to this post. No hashtags. Sound natural.`,
+    maxTokens: 60,
+    onSuccess: (text) => {
+      if (!text) return;
+      createSimComment(post, agent, text);
     }
   });
 }
 
+async function createSimComment(post, authorAgent, text) {
+  const key = APP_STATE.simAgentKeys.get(authorAgent.id);
+  if (!key) return;
+
+  try {
+    const data = await api("POST", `/api/posts/${post.id}/comment`, { text }, key);
+    const comment = normalizeServerComment(data.comment);
+
+    // Add to local map for immediate display
+    if (!APP_STATE.comments.has(post.id)) APP_STATE.comments.set(post.id, []);
+    const list = APP_STATE.comments.get(post.id);
+    if (!list.some(c => c.id === comment.id)) list.push(comment);
+
+    // Maybe post author replies
+    const postAuthor = findAgentById(post.authorId) || findAgentByName(post.author);
+    if (postAuthor && APP_STATE.simAgentKeys.has(postAuthor.id)) {
+      replyDecision(post, comment, postAuthor);
+    }
+
+    if (APP_STATE.activeCommentPostId === post.id) renderCommentSheet();
+    addActivity(`${authorAgent.name} commented on @${post.author}'s post.`, "comment");
+  } catch { /* silent */ }
+}
+
+function replyDecision(post, comment, postAuthor) {
+  const key = APP_STATE.simAgentKeys.get(postAuthor.id);
+  if (!key) return;
+  if (Math.random() >= REPLY_CHANCE) return;
+
+  const delayMs = (1 + Math.floor(Math.random() * 3)) * APP_STATE.tickMs;
+  setTimeout(() => {
+    enqueueTextGeneration({
+      prompt: `@${comment.authorName} said: "${comment.text}"`,
+      systemPrompt: `You are ${postAuthor.name}${postAuthor.personalityPrompt ? ", personality: " + postAuthor.personalityPrompt : ""}. Reply briefly to this comment on your post (10-40 chars). Sound natural.`,
+      maxTokens: 50,
+      onSuccess: async (text) => {
+        if (!text) return;
+        try {
+          await api("POST", `/api/posts/${post.id}/comment`, { text, parentId: comment.id }, key);
+          addActivity(`${postAuthor.name} replied to ${comment.authorName}.`, "reply");
+        } catch { /* silent */ }
+      }
+    });
+  }, delayMs);
+}
+
+function followDecision(agent) {
+  const key = APP_STATE.simAgentKeys.get(agent.id);
+  if (!key || !agent.likesGivenByPost) return;
+
+  for (const [authorId, likeCount] of agent.likesGivenByPost) {
+    if (likeCount < FOLLOW_LIKE_THRESHOLD) continue;
+    if (agent.following.has(authorId)) continue;
+    const target = findAgentById(authorId);
+    if (!target) continue;
+    if (Math.random() >= 0.4) continue;
+
+    agent.following.add(authorId);
+    simAction("POST", `/api/follow/${authorId}`, null, agent.id).then(data => {
+      if (data) {
+        target.followersCount = data.followerCount || target.followersCount;
+        addActivity(`${agent.name} followed ${target.name}.`, "follow");
+      }
+    });
+  }
+}
+
+// ============================================================
+// SIMULATION LOOP
+// ============================================================
 function runTick() {
   APP_STATE.tick += 1;
+
+  // Purge expired stories (local pending only; server stories use expiresAt)
+  APP_STATE.stories = APP_STATE.stories.filter(s => isStoryActive(s));
+
   let createdDrafts = 0;
 
-  APP_STATE.agents.forEach((agent) => {
+  // Only run sim logic for sim agents with keys
+  const simAgents = APP_STATE.agents.filter(a => APP_STATE.simAgentKeys.has(a.id));
+
+  simAgents.forEach((agent) => {
     const ranked = [...APP_STATE.feed]
       .filter((post) => post.mediaUrl && !agent.seenPostIds.has(post.id))
       .map((post) => ({ post, score: recommendationScore(agent, post) }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 6);
 
-    if (!ranked.length) return;
+    if (!ranked.length) {
+      storyDecision(agent);
+      followDecision(agent);
+      return;
+    }
 
     const viewed = ranked[Math.floor(Math.random() * Math.min(3, ranked.length))];
     agent.seenPostIds.add(viewed.post.id);
@@ -804,13 +1203,21 @@ function runTick() {
     }
 
     if (viewed.score > 0.55 && Math.random() > 0.35) {
-      viewed.post.likes += 1;
       agent.likesGiven += 1;
       addActivity(`${agent.name} liked post ${viewed.post.id}.`, "like");
       if (APP_STATE.selectedAgentId === "all" || APP_STATE.selectedAgentId === agent.id) {
         pushVisualAction({ type: "like", postId: viewed.post.id, agentId: agent.id });
       }
+      simAction("POST", `/api/posts/${viewed.post.id}/like`, null, agent.id);
+
+      const postAuthorId = viewed.post.authorId;
+      if (postAuthorId && postAuthorId !== agent.id) {
+        const current = agent.likesGivenByPost.get(postAuthorId) || 0;
+        agent.likesGivenByPost.set(postAuthorId, current + 1);
+      }
     }
+
+    commentDecision(agent, viewed.post, viewed.score);
 
     const boostedChance =
       APP_STATE.creativityPercent / 100 +
@@ -827,9 +1234,22 @@ function runTick() {
         .map(([topic]) => topic);
 
       const chosenTopic = preferred[Math.floor(Math.random() * preferred.length)];
-      const draft = createPost(chosenTopic, agent.name, agent.personalityPrompt);
+      const draft = createLocalPost(chosenTopic, agent.name, agent.personalityPrompt, agent.id);
       draft.caption = `${draft.caption} #${chosenTopic} #gentigram`;
-      addActivity(`${agent.name} drafted ${chosenTopic}; waiting for image generation.`, "post");
+
+      enqueueTextGeneration({
+        prompt: `Photo topic: ${chosenTopic}. Template caption: "${draft.caption.replace(/#\w+/g, "").trim()}"`,
+        systemPrompt: `You are ${agent.name}${agent.personalityPrompt ? ", personality: " + agent.personalityPrompt : ""}. Write an authentic Instagram caption (max 100 chars) for a ${chosenTopic} photo. Include 1-2 relevant hashtags. Output only the caption, no quotes.`,
+        maxTokens: 120,
+        onSuccess: (text) => {
+          if (text && text.length > 0 && text.length <= 200) {
+            draft.caption = text;
+            if (APP_STATE.currentPage === "home") renderMobileFeed();
+          }
+        }
+      });
+
+      addActivity(`${agent.name} drafted ${chosenTopic}; queued for image generation.`, "post");
       agent.lastDraftTick = APP_STATE.tick;
       enqueueImageGeneration(draft, agent.personalityPrompt, {
         publishOnSuccess: true,
@@ -838,26 +1258,30 @@ function runTick() {
       });
       createdDrafts += 1;
     }
+
+    storyDecision(agent);
+    followDecision(agent);
   });
 
   APP_STATE.insights.unshift(
-    createdDrafts ? `${createdDrafts} draft posts queued for image generation.` : "No new draft this tick."
+    createdDrafts ? `${createdDrafts} draft post${createdDrafts > 1 ? "s" : ""} queued for image generation.` : "No new draft this tick."
   );
   APP_STATE.insights = APP_STATE.insights.slice(0, 10);
 
   render();
   queueImagesForVisibleFeed();
-  persistSoon();
 }
 
 function startLoop() {
   if (APP_STATE.timer) clearInterval(APP_STATE.timer);
-
   APP_STATE.timer = setInterval(() => {
     if (APP_STATE.running) runTick();
   }, APP_STATE.tickMs);
 }
 
+// ============================================================
+// LEGACY RENDER FUNCTIONS (write to gear panel elements)
+// ============================================================
 function renderAgents() {
   ELS.agentsList.innerHTML = APP_STATE.agents
     .map(
@@ -866,9 +1290,10 @@ function renderAgents() {
         <div class="agent-head">
           <strong>${esc(agent.name)}</strong>
           <span class="badge">${esc(agent.style)}</span>
+          ${agent.is_sim ? "" : '<span class="badge" style="background:#6f4bb8">external</span>'}
         </div>
-        <p class="meta">Posts: ${agent.postsCreated} | Likes: ${agent.likesGiven}</p>
-        <p class="meta">Attention score: ${agent.attention.toFixed(2)}</p>
+        <p class="meta">Posts: ${agent.postsCreated} | Likes: ${agent.likesGiven} | Comments: ${agent.commentsGiven || 0}</p>
+        <p class="meta">Followers: ${getFollowersCount(agent)} | Following: ${getFollowingCount(agent)}</p>
         <p class="meta">Persona: ${esc(agent.personalityPrompt || "default")}</p>
       </article>`
     )
@@ -877,13 +1302,12 @@ function renderAgents() {
 
 function renderPostMedia(post) {
   if (post.mediaUrl) {
-    return `<img class="media-image" src="${esc(post.mediaUrl)}" alt="${esc(post.mediaTitle)}" loading="lazy" />`;
+    return `<img class="media-image" src="${esc(post.mediaUrl)}" alt="${esc(post.mediaTitle || "post")}" loading="lazy" />`;
   }
-
   if (post.mediaStatus === "failed") {
     return `<div class="media-skeleton media-skeleton--error"><span class="skeleton-label">Image failed</span></div>`;
   }
-  return `<div class="media-skeleton"><div class="skeleton-shimmer"></div><span class="skeleton-label">${esc(post.mediaTitle)}</span></div>`;
+  return `<div class="media-skeleton"><div class="skeleton-shimmer"></div><span class="skeleton-label">${esc(post.mediaTitle || "Loading…")}</span></div>`;
 }
 
 function renderFeed() {
@@ -957,18 +1381,18 @@ function renderControlValues() {
   ELS.postRate.value = String(APP_STATE.creativityPercent);
   ELS.postRateLabel.textContent = `${APP_STATE.creativityPercent}%`;
   ELS.imageApiState.textContent = APP_STATE.imageApiReady
-    ? `Image API: OpenAI connected${APP_STATE.lastImageError ? ` (last error: ${APP_STATE.lastImageError})` : ""}`
-    : "Image API: unavailable (start server with OPENAI_API_KEY)";
+    ? `Image API: connected${APP_STATE.lastImageError ? ` (last err: ${APP_STATE.lastImageError.slice(0, 40)})` : ""}`
+    : "Image API: unavailable (need OPENAI_API_KEY)";
   ELS.keyMissingBanner.classList.toggle("hidden", APP_STATE.imageApiReady);
   if (!APP_STATE.imageApiReady) {
     if (APP_STATE.openAiKeyPresent && !APP_STATE.openAiKeyValidFormat) {
       ELS.keyWarningTitle.textContent = "OpenAI key detected, but format looks invalid.";
       ELS.keyWarningText.innerHTML =
-        "Use a terminal key that starts with <code>sk-</code>. Avoid quotes, spaces, or line breaks. Example: <code>OPENAI_API_KEY=sk-... npm start</code>.";
+        "Key must start with <code>sk-</code>. Example: <code>OPENAI_API_KEY=sk-... npm start</code>.";
     } else {
       ELS.keyWarningTitle.textContent = "OpenAI key missing.";
       ELS.keyWarningText.innerHTML =
-        "Start server with <code>OPENAI_API_KEY=sk-... npm start</code> to enable feed image posting.";
+        "Start server with <code>OPENAI_API_KEY=sk-... npm start</code> to enable image posting.";
     }
   }
   ELS.guardianToggle.checked = APP_STATE.runtimeGuardianEnabled;
@@ -980,9 +1404,7 @@ function renderChat() {
   ELS.chatList.innerHTML = APP_STATE.chatMessages
     .map((msg) => `<article class="chat-msg ${msg.role === "me" ? "me" : "bot"}">${esc(msg.text)}</article>`)
     .join("");
-  if (atBottom) {
-    ELS.chatList.scrollTop = ELS.chatList.scrollHeight;
-  }
+  if (atBottom) ELS.chatList.scrollTop = ELS.chatList.scrollHeight;
 }
 
 function renderAgentPovOptions() {
@@ -999,18 +1421,445 @@ function pushVisualAction(action) {
   APP_STATE.visualActions = APP_STATE.visualActions.slice(-20);
 }
 
+// ============================================================
+// MOBILE RENDER FUNCTIONS
+// ============================================================
+function renderNotifBadge() {
+  const unseenCount = APP_STATE.notifications.filter((n) => !n.seen).length;
+  const badge = document.getElementById("notif-badge");
+  const dot = document.getElementById("nav-notif-dot");
+  if (badge) {
+    badge.textContent = String(unseenCount);
+    badge.classList.toggle("hidden", unseenCount === 0);
+  }
+  if (dot) dot.classList.toggle("hidden", unseenCount === 0);
+}
+
+function renderStoriesBar() {
+  const bar = document.getElementById("stories-bar");
+  if (!bar) return;
+
+  const activeStories = APP_STATE.stories.filter(s => isStoryActive(s));
+
+  const byAuthor = new Map();
+  activeStories.forEach((story) => {
+    if (!byAuthor.has(story.authorId)) byAuthor.set(story.authorId, story);
+  });
+
+  if (byAuthor.size === 0) {
+    bar.innerHTML = '<span class="stories-empty meta">Stories appear here as agents post…</span>';
+    return;
+  }
+
+  bar.innerHTML = Array.from(byAuthor.values())
+    .map((story) => {
+      const agent = findAgentById(story.authorId);
+      const color = getAvatarColor(agent ? agent.style : "fashion");
+      const isReady = story.imageStatus === "ready";
+      return `
+        <button class="story-circle" data-story-author-id="${esc(story.authorId)}" aria-label="View ${esc(story.authorName)}'s story">
+          <div class="story-ring${isReady ? "" : " seen"}">
+            <div class="story-avatar" style="background:${color}">${esc(story.authorName[0].toUpperCase())}</div>
+          </div>
+          <span class="story-name">${esc(story.authorName)}</span>
+        </button>`;
+    })
+    .join("");
+}
+
+function renderMobileFeed() {
+  const feedEl = document.getElementById("insta-feed");
+  if (!feedEl) return;
+
+  const posts = APP_STATE.feed.slice(0, 50);
+  if (!posts.length) {
+    feedEl.innerHTML = '<div class="feed-empty">Warming up the simulation… posts appear here shortly.</div>';
+    return;
+  }
+
+  feedEl.innerHTML = posts
+    .map((post) => {
+      const localComments = APP_STATE.comments.get(post.id) || [];
+      const commentCount = localComments.length || post.commentCount || 0;
+      const authorAgent = post.authorId ? findAgentById(post.authorId) : findAgentByName(post.author);
+      const avatarColor = getAvatarColor(authorAgent ? authorAgent.style : "fashion");
+      const initial = post.author ? post.author[0].toUpperCase() : "?";
+
+      let mediaHtml;
+      if (post.mediaUrl) {
+        mediaHtml = `<img class="media-image" src="${esc(post.mediaUrl)}" alt="${esc(post.caption)}" loading="lazy" />`;
+      } else if (post.mediaStatus === "failed") {
+        mediaHtml = `<div class="media-skeleton media-skeleton--error" style="min-height:300px"><span class="skeleton-label">Image failed</span></div>`;
+      } else {
+        mediaHtml = `<div class="media-skeleton" style="min-height:300px"><div class="skeleton-shimmer"></div><span class="skeleton-label">${esc(post.mediaTitle || "Loading…")}</span></div>`;
+      }
+
+      return `
+        <article class="insta-post" data-post-id="${esc(post.id)}">
+          <div class="insta-post-header">
+            <button class="avatar-btn" data-agent-name="${esc(post.author)}" aria-label="View ${esc(post.author)}'s profile">
+              <div class="avatar" style="background:${avatarColor}">${esc(initial)}</div>
+            </button>
+            <div class="post-author-info">
+              <span class="post-username">${esc(post.author)}</span>
+              <span class="post-topic meta">${esc(post.topic)}</span>
+            </div>
+          </div>
+          <div class="insta-post-media" data-post-id="${esc(post.id)}">
+            ${mediaHtml}
+          </div>
+          <div class="insta-post-actions">
+            <div class="action-left">
+              <button class="action-btn like-btn" data-post-id="${esc(post.id)}" aria-label="Like post">❤</button>
+              <button class="action-btn comment-btn" data-post-id="${esc(post.id)}" aria-label="View comments">💬</button>
+              <button class="action-btn" aria-label="Share">✈</button>
+            </div>
+            <button class="action-btn" aria-label="Bookmark">🔖</button>
+          </div>
+          <div class="insta-post-info">
+            <div class="likes-count"><strong>${post.likes} like${post.likes !== 1 ? "s" : ""}</strong></div>
+            <div class="caption"><strong>${esc(post.author)}</strong> ${esc(post.caption)}</div>
+            ${commentCount > 0
+              ? `<button class="view-comments-btn" data-post-id="${esc(post.id)}">View all ${commentCount} comment${commentCount !== 1 ? "s" : ""}</button>`
+              : ""}
+          </div>
+        </article>`;
+    })
+    .join("");
+}
+
+function renderExploreGrid() {
+  const grid = document.getElementById("explore-grid");
+  if (!grid) return;
+
+  const posts = [...APP_STATE.feed];
+  if (!posts.length) {
+    grid.innerHTML = '<div class="grid-empty meta">No posts yet. Run the simulation to populate the explore grid.</div>';
+    return;
+  }
+
+  grid.innerHTML = posts
+    .slice(0, 90)
+    .map((post) => {
+      const imgHtml = post.mediaUrl
+        ? `<img src="${esc(post.mediaUrl)}" alt="${esc(post.caption)}" loading="lazy" class="grid-img" />`
+        : `<div class="grid-placeholder" style="background:${esc(post.mediaGradient)}"><span class="grid-placeholder-icon">📷</span></div>`;
+      return `
+        <button class="grid-item" data-post-id="${esc(post.id)}" aria-label="Post by ${esc(post.author)}">
+          ${imgHtml}
+        </button>`;
+    })
+    .join("");
+}
+
+function renderNotifications() {
+  const listEl = document.getElementById("activity-list");
+  if (!listEl) return;
+
+  APP_STATE.notifications.forEach((n) => { n.seen = true; });
+  renderNotifBadge();
+
+  if (!APP_STATE.notifications.length) {
+    listEl.innerHTML = '<div class="notif-empty meta">No notifications yet. Keep the simulation running!</div>';
+    return;
+  }
+
+  const icons = { like: "❤", comment: "💬", follow: "👤", reply: "↩" };
+  listEl.innerHTML = APP_STATE.notifications
+    .slice(0, 100)
+    .map((notif) => {
+      const icon = icons[notif.type] || "•";
+      let text = "";
+      switch (notif.type) {
+        case "like": text = `<strong>${esc(notif.actorName)}</strong> liked a post`; break;
+        case "comment": text = `<strong>${esc(notif.actorName)}</strong> commented on a post`; break;
+        case "follow": text = `<strong>${esc(notif.actorName)}</strong> started following`; break;
+        case "reply": text = `<strong>${esc(notif.actorName)}</strong> replied to a comment`; break;
+        default: text = esc(notif.actorName);
+      }
+      return `
+        <div class="notif-item">
+          <span class="notif-icon">${icon}</span>
+          <span class="notif-text">${text}</span>
+          <span class="notif-tick meta">t${notif.tick}</span>
+        </div>`;
+    })
+    .join("");
+}
+
+function renderProfilePage() {
+  const el = document.getElementById("profile-page-content");
+  if (!el) return;
+
+  const agents = APP_STATE.agents;
+  el.innerHTML = `
+    <div class="profile-header">
+      <h2>All Agents</h2>
+      <p class="meta">${agents.length} agent${agents.length !== 1 ? "s" : ""} · tick ${APP_STATE.tick}</p>
+    </div>
+    <div class="agents-grid">
+      ${agents.map((agent) => {
+        const posts = APP_STATE.feed.filter((p) => p.author === agent.name || p.authorId === agent.id);
+        const color = getAvatarColor(agent.style);
+        const followers = getFollowersCount(agent);
+        const following = getFollowingCount(agent);
+        return `
+          <button class="agent-profile-card" data-agent-name="${esc(agent.name)}" aria-label="View ${esc(agent.name)}'s profile">
+            <div class="avatar avatar-lg" style="background:${color}">${esc(agent.name[0].toUpperCase())}</div>
+            <strong>${esc(agent.name)}</strong>
+            <span class="meta">${esc(agent.style)}</span>
+            ${agent.is_sim ? "" : '<span class="meta" style="color:#6f4bb8">external</span>'}
+            <div class="agent-stats meta">
+              <span>${posts.length} posts</span>
+              <span>${followers} followers</span>
+              <span>${following} following</span>
+            </div>
+          </button>`;
+      }).join("")}
+    </div>`;
+}
+
+function renderCommentSheet() {
+  const postId = APP_STATE.activeCommentPostId;
+  const listEl = document.getElementById("comment-list");
+  const sheet = document.getElementById("comment-sheet");
+  if (!sheet) return;
+
+  if (!postId) {
+    sheet.classList.add("hidden");
+    return;
+  }
+
+  sheet.classList.remove("hidden");
+  if (!listEl) return;
+
+  const flatComments = APP_STATE.comments.get(postId) || [];
+  const comments = buildCommentTree(flatComments);
+
+  if (!comments.length) {
+    listEl.innerHTML = '<div class="comment-empty meta">No comments yet. Keep the simulation running!</div>';
+    return;
+  }
+
+  listEl.innerHTML = comments
+    .map((comment) => `
+      <div class="comment-item">
+        <div class="comment-author">
+          <strong>${esc(comment.authorName)}</strong>
+          <span class="meta"> · t${comment.tick}</span>
+        </div>
+        <div class="comment-text">${esc(comment.text)}</div>
+        ${comment.replies
+          .map((reply) => `
+            <div class="comment-reply">
+              <strong>${esc(reply.authorName)}</strong> ${esc(reply.text)}
+              <span class="meta"> t${reply.tick}</span>
+            </div>`)
+          .join("")}
+      </div>`)
+    .join("");
+}
+
+// ============================================================
+// MOBILE UI — Page Switching
+// ============================================================
+function switchPage(page) {
+  APP_STATE.currentPage = page;
+
+  document.querySelectorAll(".page").forEach((el) => el.classList.remove("active"));
+  document.querySelectorAll(".nav-btn").forEach((btn) => btn.classList.remove("active"));
+
+  const pageEl = document.getElementById(`page-${page}`);
+  if (pageEl) pageEl.classList.add("active");
+
+  const navBtn = document.querySelector(`.nav-btn[data-page="${page}"]`);
+  if (navBtn) navBtn.classList.add("active");
+
+  if (page === "home") {
+    renderStoriesBar();
+    renderMobileFeed();
+  } else if (page === "explore") {
+    renderExploreGrid();
+  } else if (page === "activity") {
+    renderNotifications();
+  } else if (page === "profile") {
+    renderProfilePage();
+  }
+}
+
+// ============================================================
+// STORY VIEWER
+// ============================================================
+function openStoryViewer(authorId) {
+  const stories = APP_STATE.stories.filter(
+    (s) => s.authorId === authorId && s.imageStatus === "ready"
+  );
+  if (!stories.length) return;
+
+  APP_STATE.activeStoryIndex = 0;
+  const viewer = document.getElementById("story-viewer");
+  if (!viewer) return;
+
+  viewer.classList.remove("hidden");
+  viewer.dataset.storyAuthorId = authorId;
+  renderStoryViewer(stories, authorId);
+  startStoryTimer(stories, authorId);
+}
+
+function renderStoryViewer(stories, authorId) {
+  const story = stories[APP_STATE.activeStoryIndex];
+  if (!story) return;
+
+  const agent = findAgentById(story.authorId);
+  const color = getAvatarColor(agent ? agent.style : "fashion");
+
+  const content = document.getElementById("story-content");
+  const footer = document.getElementById("story-footer");
+  const progressContainer = document.getElementById("story-progress-container");
+  const authorEl = document.getElementById("story-viewer-author");
+
+  if (progressContainer) {
+    const pct = ((APP_STATE.activeStoryIndex + 1) / stories.length) * 100;
+    progressContainer.innerHTML = `<div class="story-progress-fill" style="width:${pct}%"></div>`;
+  }
+
+  if (authorEl) {
+    authorEl.innerHTML = `
+      <div class="avatar" style="background:${color}">${esc(story.authorName[0].toUpperCase())}</div>
+      <span>${esc(story.authorName)}</span>`;
+  }
+
+  if (content) {
+    content.innerHTML = `<img src="${esc(story.imageUrl)}" alt="${esc(story.caption)}" class="story-image" />`;
+  }
+
+  if (footer) {
+    footer.innerHTML = `<p class="story-caption">${esc(story.caption)}</p>`;
+  }
+}
+
+function startStoryTimer(stories, authorId) {
+  if (APP_STATE.storyViewerTimer) clearTimeout(APP_STATE.storyViewerTimer);
+
+  APP_STATE.storyViewerTimer = setTimeout(() => {
+    if (APP_STATE.activeStoryIndex < stories.length - 1) {
+      APP_STATE.activeStoryIndex += 1;
+      renderStoryViewer(stories, authorId);
+      startStoryTimer(stories, authorId);
+    } else {
+      closeStoryViewer();
+    }
+  }, 5000);
+}
+
+function closeStoryViewer() {
+  if (APP_STATE.storyViewerTimer) {
+    clearTimeout(APP_STATE.storyViewerTimer);
+    APP_STATE.storyViewerTimer = null;
+  }
+  const viewer = document.getElementById("story-viewer");
+  if (viewer) viewer.classList.add("hidden");
+}
+
+// ============================================================
+// COMMENT SHEET
+// ============================================================
+async function openCommentSheet(postId) {
+  APP_STATE.activeCommentPostId = postId;
+  renderCommentSheet();
+
+  // Fetch fresh comments from server
+  try {
+    const data = await api("GET", `/api/posts/${postId}/comments`);
+    const flat = (data.comments || []).map(normalizeServerComment);
+    APP_STATE.comments.set(postId, flat);
+    renderCommentSheet();
+  } catch { /* show what we have */ }
+}
+
+function closeCommentSheet() {
+  APP_STATE.activeCommentPostId = null;
+  const sheet = document.getElementById("comment-sheet");
+  if (sheet) sheet.classList.add("hidden");
+}
+
+// ============================================================
+// AGENT PROFILE MODAL
+// ============================================================
+async function openAgentProfileModal(agentName) {
+  const modal = document.getElementById("profile-modal");
+  const content = document.getElementById("profile-modal-content");
+  if (!modal || !content) return;
+
+  let agent = findAgentByName(agentName);
+  if (!agent) return;
+
+  // Try to fetch fresh agent data from server
+  try {
+    const data = await api("GET", `/api/agents/${agent.id}`);
+    if (data.agent) {
+      agent.followersCount = data.agent.followers_count || 0;
+      agent.followingCount = data.agent.following_count || 0;
+      agent.postsCreated = data.agent.posts_count || 0;
+    }
+  } catch { /* use cached data */ }
+
+  APP_STATE.viewingAgentId = agent.id;
+  const posts = APP_STATE.feed.filter((p) => p.author === agentName || p.authorId === agent.id);
+  const color = getAvatarColor(agent.style);
+  const followers = getFollowersCount(agent);
+  const following = getFollowingCount(agent);
+
+  content.innerHTML = `
+    <div class="profile-modal-header">
+      <div class="avatar avatar-xl" style="background:${color}">${esc(agentName[0].toUpperCase())}</div>
+      <div class="profile-modal-info">
+        <h3>${esc(agentName)}</h3>
+        <span class="badge">${esc(agent.style)}</span>
+        ${agent.is_sim ? "" : '<span class="badge" style="background:#6f4bb8;margin-left:4px">external</span>'}
+        <p class="meta" style="margin-top:4px">${esc(agent.personalityPrompt || "No bio yet.")}</p>
+        <div class="profile-stats">
+          <div><strong>${posts.length}</strong><span class="meta"> posts</span></div>
+          <div><strong>${followers}</strong><span class="meta"> followers</span></div>
+          <div><strong>${following}</strong><span class="meta"> following</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="profile-post-grid">
+      ${posts.slice(0, 9).map((post) => {
+        const imgHtml = post.mediaUrl
+          ? `<img src="${esc(post.mediaUrl)}" alt="" loading="lazy" class="grid-img" />`
+          : `<div class="grid-placeholder" style="background:${esc(post.mediaGradient)}"></div>`;
+        return `<div class="grid-item">${imgHtml}</div>`;
+      }).join("")}
+    </div>`;
+
+  modal.classList.remove("hidden");
+}
+
+function closeAgentProfileModal() {
+  APP_STATE.viewingAgentId = null;
+  const modal = document.getElementById("profile-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+// ============================================================
+// VISUAL ACTIONS
+// ============================================================
 function applyVisualActions() {
   const actions = APP_STATE.visualActions.splice(0);
   actions.forEach((action) => {
-    const card = ELS.feedList.querySelector(`[data-post-id="${action.postId}"]`);
+    const feedEl = document.getElementById("insta-feed") || ELS.feedList;
+    const card = feedEl ? feedEl.querySelector(`[data-post-id="${action.postId}"]`) : null;
     if (!card) return;
     card.classList.add("agent-focus");
-    card.scrollIntoView({ block: "center", behavior: "smooth" });
+    card.scrollIntoView({ block: "nearest", behavior: "smooth" });
     setTimeout(() => card.classList.remove("agent-focus"), 1200);
     if (action.type === "like") {
       const heart = document.createElement("span");
       heart.className = "heart-bubble";
       heart.textContent = "❤";
+      card.style.position = "relative";
       card.appendChild(heart);
       setTimeout(() => heart.remove(), 1000);
     }
@@ -1018,20 +1867,22 @@ function applyVisualActions() {
 }
 
 function startAutoFeedScroll() {
-  if (APP_STATE.autoScrollTimer) {
-    clearInterval(APP_STATE.autoScrollTimer);
-  }
+  if (APP_STATE.autoScrollTimer) clearInterval(APP_STATE.autoScrollTimer);
   APP_STATE.autoScrollTimer = setInterval(() => {
     if (!APP_STATE.running) return;
-    const el = ELS.feedList;
+    if (APP_STATE.currentPage !== "home") return;
+    const el = document.getElementById("insta-feed");
     if (!el) return;
     const max = el.scrollHeight - el.clientHeight;
     if (max <= 0) return;
-    const next = el.scrollTop + 1.4;
+    const next = el.scrollTop + 1.2;
     el.scrollTop = next >= max ? 0 : next;
   }, 35);
 }
 
+// ============================================================
+// MAIN RENDER DISPATCH
+// ============================================================
 function render() {
   renderAgents();
   renderAgentPovOptions();
@@ -1044,8 +1895,24 @@ function render() {
   renderChat();
   renderSimState();
   renderControlValues();
+
+  renderNotifBadge();
+  const page = APP_STATE.currentPage;
+  if (page === "home") {
+    renderStoriesBar();
+    renderMobileFeed();
+  } else if (page === "explore") {
+    renderExploreGrid();
+  } else if (page === "profile") {
+    renderProfilePage();
+  }
+
+  if (APP_STATE.activeCommentPostId) renderCommentSheet();
 }
 
+// ============================================================
+// LEGACY POST MODAL
+// ============================================================
 function openPostModal(postId) {
   const post = APP_STATE.feed.find((item) => item.id === postId);
   if (!post) return;
@@ -1058,11 +1925,11 @@ function openPostModal(postId) {
 
   ELS.modalMedia.style.background = post.mediaGradient;
   ELS.modalMedia.innerHTML = renderPostMedia(post);
-  ELS.modalAuthor.textContent = `@${post.author} (image)`;
+  ELS.modalAuthor.textContent = `@${post.author}`;
   ELS.modalCaption.textContent = post.caption;
-  ELS.modalMeta.textContent = `${post.topic} · ${post.likes} likes · created at tick ${post.createdAtTick}`;
+  ELS.modalMeta.textContent = `${post.topic} · ${post.likes} likes`;
   ELS.modalRecs.innerHTML = recs
-    .map((item) => `<li>${esc(item.agent)} recommendation score: ${item.score.toFixed(2)}</li>`)
+    .map((item) => `<li>${esc(item.agent)}: ${item.score.toFixed(2)}</li>`)
     .join("");
 
   ELS.refreshModalImageBtn.dataset.postId = post.id;
@@ -1074,22 +1941,56 @@ function openPostModal(postId) {
 function closePostModal() {
   ELS.postModal.classList.add("hidden");
   ELS.postModal.setAttribute("aria-hidden", "true");
-  if (APP_STATE.modalLastFocusedEl) {
-    APP_STATE.modalLastFocusedEl.focus();
-  }
+  if (APP_STATE.modalLastFocusedEl) APP_STATE.modalLastFocusedEl.focus();
 }
+
+// ============================================================
+// GEAR PANEL UI
+// ============================================================
+function openGearPanel() {
+  const panel = document.getElementById("gear-panel");
+  if (panel) panel.classList.remove("hidden");
+}
+
+function closeGearPanel() {
+  const panel = document.getElementById("gear-panel");
+  if (panel) panel.classList.add("hidden");
+}
+
+// ============================================================
+// CONNECT SHEET UI
+// ============================================================
+function openConnectSheet() {
+  const sheet = document.getElementById("connect-sheet");
+  if (!sheet) return;
+  // Show current endpoint
+  const endpointEl = document.getElementById("connect-endpoint-url");
+  if (endpointEl) endpointEl.textContent = window.location.origin;
+  sheet.classList.remove("hidden");
+}
+
+function closeConnectSheet() {
+  const sheet = document.getElementById("connect-sheet");
+  if (sheet) sheet.classList.add("hidden");
+}
+
+// ============================================================
+// EVENT LISTENERS — Gear Panel
+// ============================================================
+document.getElementById("gear-btn").addEventListener("click", openGearPanel);
+document.getElementById("close-gear").addEventListener("click", closeGearPanel);
+document.getElementById("close-connect").addEventListener("click", closeConnectSheet);
+document.getElementById("connect-backdrop").addEventListener("click", closeConnectSheet);
 
 ELS.speed.addEventListener("input", (event) => {
   APP_STATE.tickMs = Number(event.target.value);
   startLoop();
   renderControlValues();
-  persistSoon();
 });
 
 ELS.postRate.addEventListener("input", (event) => {
   APP_STATE.creativityPercent = Number(event.target.value);
   renderControlValues();
-  persistSoon();
 });
 
 ELS.toggleBtn.addEventListener("click", () => {
@@ -1097,41 +1998,84 @@ ELS.toggleBtn.addEventListener("click", () => {
   if (APP_STATE.running) APP_STATE.userBrowsingFeed = false;
   addActivity(`Simulation ${APP_STATE.running ? "resumed" : "paused"}.`, "system");
   render();
-  persistSoon();
 });
 
 ELS.stepBtn.addEventListener("click", () => {
   runTick();
 });
 
-ELS.resetBtn.addEventListener("click", () => {
-  const ok = window.confirm("Reset simulation state and regenerate starter content?");
+ELS.resetBtn.addEventListener("click", async () => {
+  const ok = window.confirm("Reset feed? This clears all posts, likes, comments, and stories. Agents and API keys are preserved.");
   if (!ok) return;
-  APP_STATE.tick = 0;
-  APP_STATE.nextPostSeq = 1;
-  APP_STATE.userBrowsingFeed = false;
-  setupInitialState();
-  if (APP_STATE.imageApiReady) seedInitialPosts();
+  try {
+    await api("POST", "/api/admin/reset");
+    addActivity("Feed reset via admin.", "system");
+  } catch (e) {
+    addActivity(`Reset failed: ${e.message}`, "error");
+  }
   render();
-  persistSoon();
 });
 
-ELS.agentForm.addEventListener("submit", (event) => {
+// Register Agent form (renamed from "Add Agent")
+ELS.agentForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const name = ELS.agentName.value.trim();
   const style = ELS.agentStyle.value;
-  const personalityPrompt = safePersonality(ELS.agentPersonality.value);
+  const personality = safePersonality(ELS.agentPersonality.value);
   if (!name) return;
 
-  APP_STATE.agents.push(createAgent(name, style, personalityPrompt));
-  APP_STATE.insights.unshift(`New agent ${name} joined with ${style} preference.`);
-  APP_STATE.insights = APP_STATE.insights.slice(0, 10);
-  addActivity(`New agent joined: ${name} (${style}).`, "system");
-  ELS.agentName.value = "";
-  ELS.agentPersonality.value = "";
-  render();
-  persistSoon();
+  const btn = ELS.agentForm.querySelector("button[type=submit]");
+  if (btn) btn.disabled = true;
+
+  try {
+    const data = await api("POST", "/api/register", { name, style, personality });
+    const key = data.apiKey || "";
+
+    // Show the API key
+    if (ELS.registerResult) ELS.registerResult.classList.remove("hidden");
+    if (ELS.registerApiKey) ELS.registerApiKey.textContent = key;
+    if (ELS.curlExamples) {
+      const origin = window.location.origin;
+      ELS.curlExamples.textContent = [
+        `# Post:`,
+        `curl -X POST ${origin}/api/posts \\`,
+        `  -H "Authorization: Bearer ${key}" \\`,
+        `  -H "Content-Type: application/json" \\`,
+        `  -d '{"caption":"hello world","topic":"tech","imageUrl":"https://..."}'`,
+        ``,
+        `# Like a post:`,
+        `curl -X POST ${origin}/api/posts/{postId}/like \\`,
+        `  -H "Authorization: Bearer ${key}"`,
+        ``,
+        `# Follow an agent:`,
+        `curl -X POST ${origin}/api/follow/{agentId} \\`,
+        `  -H "Authorization: Bearer ${key}"`
+      ].join("\n");
+    }
+
+    ELS.agentName.value = "";
+    ELS.agentPersonality.value = "";
+    addActivity(`New agent registered: ${name} (${style}).`, "system");
+  } catch (e) {
+    alert(e.message || "Registration failed");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 });
+
+// Copy API key button
+if (ELS.copyApiKeyBtn) {
+  ELS.copyApiKeyBtn.addEventListener("click", () => {
+    const key = ELS.registerApiKey ? ELS.registerApiKey.textContent : "";
+    if (!key) return;
+    navigator.clipboard.writeText(key).then(() => {
+      ELS.copyApiKeyBtn.textContent = "Copied!";
+      setTimeout(() => { ELS.copyApiKeyBtn.textContent = "Copy"; }, 2000);
+    }).catch(() => {
+      prompt("Copy this key:", key);
+    });
+  });
+}
 
 ELS.feedList.addEventListener("click", (event) => {
   const card = event.target.closest(".post");
@@ -1152,8 +2096,7 @@ ELS.agentPov.addEventListener("change", (event) => {
 });
 
 ELS.refreshFeedViewBtn.addEventListener("click", () => {
-  renderFeed();
-  queueImagesForVisibleFeed();
+  fetchFeed().then(() => { renderFeed(); queueImagesForVisibleFeed(); });
 });
 
 ELS.chatForm.addEventListener("submit", async (event) => {
@@ -1176,7 +2119,6 @@ ELS.refreshModalImageBtn.addEventListener("click", () => {
   const postId = ELS.refreshModalImageBtn.dataset.postId;
   const post = APP_STATE.feed.find((item) => item.id === postId);
   if (!post) return;
-
   const agent = findAgentByName(post.author);
   enqueueImageGeneration(post, agent?.personalityPrompt || "", {
     publishOnSuccess: false,
@@ -1184,7 +2126,6 @@ ELS.refreshModalImageBtn.addEventListener("click", () => {
     retriesLeft: 3
   });
   render();
-  persistSoon();
 });
 
 ELS.clearImageErrorsBtn.addEventListener("click", () => {
@@ -1192,31 +2133,32 @@ ELS.clearImageErrorsBtn.addEventListener("click", () => {
   APP_STATE.lastImageError = "";
   renderImageErrors();
   renderControlValues();
-  persistSoon();
 });
 
-ELS.startNewSessionBtn.addEventListener("click", () => {
-  const ok = window.confirm(
-    "Wipe all local simulation data and reload? This cannot be undone."
-  );
+ELS.startNewSessionBtn.addEventListener("click", async () => {
+  const ok = window.confirm("Reset all server data (posts, stories, comments, follows)? Agents and API keys are preserved.");
   if (!ok) return;
-  APP_STATE.running = false;
-  APP_STATE.imageQueue = [];
-  APP_STATE.runtimeLogs = [];
-  APP_STATE.imageErrors = [];
-  APP_STATE.chatMessages = [{ role: "bot", text: "Session reset. I am ready." }];
-  resetDatabaseAndReload();
+  try {
+    await api("POST", "/api/admin/reset");
+    APP_STATE.running = false;
+    APP_STATE.imageQueue = [];
+    APP_STATE.runtimeLogs = [];
+    APP_STATE.imageErrors = [];
+    APP_STATE.chatMessages = [{ role: "bot", text: "Session reset. I am ready." }];
+    addActivity("Full reset complete.", "system");
+    render();
+  } catch (e) {
+    addActivity(`Reset failed: ${e.message}`, "error");
+  }
 });
 
 ELS.guardianToggle.addEventListener("change", (event) => {
   APP_STATE.runtimeGuardianEnabled = Boolean(event.target.checked);
   renderRuntimeLogs();
-  persistSoon();
 });
 
 ELS.guardianAutoreload.addEventListener("change", (event) => {
   APP_STATE.runtimeGuardianAutoReload = Boolean(event.target.checked);
-  persistSoon();
 });
 
 ELS.runtimeErrorList.addEventListener("click", async (event) => {
@@ -1231,12 +2173,10 @@ ELS.runtimeErrorList.addEventListener("click", async (event) => {
   try {
     const result = await applySuggestedPatch(logItem);
     addActivity(`Patch applied: ${result.applied || 0} change(s). Reloading app.`, "system");
-    persistSoon();
     setTimeout(() => location.reload(), 1200);
   } catch (error) {
     addRuntimeLog(error.message || "Patch apply failed", "patch-agent");
     renderRuntimeLogs();
-    persistSoon();
   } finally {
     button.disabled = false;
     button.textContent = "Apply Patch";
@@ -1248,8 +2188,185 @@ ELS.postModal.addEventListener("click", (event) => {
   if (event.target === ELS.postModal) closePostModal();
 });
 
+// ============================================================
+// EVENT LISTENERS — Mobile Navigation
+// ============================================================
+document.querySelector(".bottom-nav").addEventListener("click", (event) => {
+  const btn = event.target.closest(".nav-btn");
+  if (!btn) return;
+  const page = btn.dataset.page;
+  if (!page) return;
+  if (page === "create") {
+    openConnectSheet();
+    return;
+  }
+  switchPage(page);
+});
+
+// ============================================================
+// EVENT LISTENERS — Home Feed (mobile)
+// ============================================================
+document.getElementById("insta-feed").addEventListener("click", (event) => {
+  const likeBtn = event.target.closest(".like-btn");
+  if (likeBtn) {
+    const postId = likeBtn.dataset.postId;
+    const post = APP_STATE.feed.find((p) => p.id === postId);
+    if (post) {
+      post.likes += 1;  // optimistic update
+      likeBtn.classList.add("liked");
+      renderMobileFeed();
+      // Use first sim agent key as viewer proxy (or no-op if no keys)
+      const firstKey = [...APP_STATE.simAgentKeys.values()][0];
+      if (firstKey) {
+        api("POST", `/api/posts/${postId}/like`, null, firstKey).catch(() => {});
+      }
+    }
+    return;
+  }
+
+  const commentBtn = event.target.closest(".comment-btn");
+  if (commentBtn) {
+    openCommentSheet(commentBtn.dataset.postId);
+    return;
+  }
+
+  const viewCommentsBtn = event.target.closest(".view-comments-btn");
+  if (viewCommentsBtn) {
+    openCommentSheet(viewCommentsBtn.dataset.postId);
+    return;
+  }
+
+  const avatarBtn = event.target.closest(".avatar-btn");
+  if (avatarBtn) {
+    openAgentProfileModal(avatarBtn.dataset.agentName);
+    return;
+  }
+});
+
+// Double-tap to like
+let lastTapTime = 0;
+let lastTapPostId = null;
+document.getElementById("insta-feed").addEventListener("touchend", (event) => {
+  const media = event.target.closest(".insta-post-media");
+  if (!media) return;
+  const postId = media.dataset.postId;
+  const now = Date.now();
+  if (postId === lastTapPostId && now - lastTapTime < 350) {
+    const post = APP_STATE.feed.find((p) => p.id === postId);
+    if (post) {
+      post.likes += 1;
+      const heart = document.createElement("span");
+      heart.className = "heart-bubble";
+      heart.textContent = "❤";
+      heart.style.fontSize = "3rem";
+      heart.style.top = "50%";
+      heart.style.right = "50%";
+      heart.style.transform = "translate(50%, -50%)";
+      media.style.position = "relative";
+      media.appendChild(heart);
+      setTimeout(() => heart.remove(), 1000);
+      renderMobileFeed();
+      const firstKey = [...APP_STATE.simAgentKeys.values()][0];
+      if (firstKey) api("POST", `/api/posts/${postId}/like`, null, firstKey).catch(() => {});
+    }
+    lastTapTime = 0;
+    lastTapPostId = null;
+  } else {
+    lastTapTime = now;
+    lastTapPostId = postId;
+  }
+});
+
+// Stories bar
+document.getElementById("stories-bar").addEventListener("click", (event) => {
+  const circle = event.target.closest(".story-circle");
+  if (!circle) return;
+  openStoryViewer(circle.dataset.storyAuthorId);
+});
+
+// ============================================================
+// EVENT LISTENERS — Story Viewer
+// ============================================================
+document.getElementById("close-story").addEventListener("click", closeStoryViewer);
+
+document.getElementById("story-tap-left").addEventListener("click", () => {
+  const viewer = document.getElementById("story-viewer");
+  if (!viewer || viewer.classList.contains("hidden")) return;
+  const authorId = viewer.dataset ? viewer.dataset.storyAuthorId : null;
+  if (!authorId) return;
+  const stories = APP_STATE.stories.filter(s => s.authorId === authorId && s.imageStatus === "ready");
+  if (APP_STATE.activeStoryIndex > 0) {
+    APP_STATE.activeStoryIndex -= 1;
+    renderStoryViewer(stories, authorId);
+    startStoryTimer(stories, authorId);
+  } else {
+    closeStoryViewer();
+  }
+});
+
+document.getElementById("story-tap-right").addEventListener("click", () => {
+  const viewer = document.getElementById("story-viewer");
+  if (!viewer || viewer.classList.contains("hidden")) return;
+  const authorId = viewer.dataset ? viewer.dataset.storyAuthorId : null;
+  if (!authorId) return;
+  const stories = APP_STATE.stories.filter(s => s.authorId === authorId && s.imageStatus === "ready");
+  if (APP_STATE.activeStoryIndex < stories.length - 1) {
+    APP_STATE.activeStoryIndex += 1;
+    renderStoryViewer(stories, authorId);
+    startStoryTimer(stories, authorId);
+  } else {
+    closeStoryViewer();
+  }
+});
+
+// ============================================================
+// EVENT LISTENERS — Comment Sheet
+// ============================================================
+document.getElementById("close-comments").addEventListener("click", closeCommentSheet);
+document.getElementById("comment-sheet").addEventListener("click", (event) => {
+  if (event.target.classList.contains("sheet-backdrop")) closeCommentSheet();
+});
+
+// ============================================================
+// EVENT LISTENERS — Profile Modal
+// ============================================================
+document.getElementById("close-profile-modal").addEventListener("click", closeAgentProfileModal);
+document.getElementById("profile-modal").addEventListener("click", (event) => {
+  if (event.target.classList.contains("profile-modal-backdrop")) closeAgentProfileModal();
+});
+
+// ============================================================
+// EVENT LISTENERS — Explore Grid
+// ============================================================
+document.getElementById("explore-grid").addEventListener("click", (event) => {
+  const item = event.target.closest(".grid-item");
+  if (!item) return;
+  const postId = item.dataset.postId;
+  if (!postId) return;
+  openPostModal(postId);
+});
+
+// ============================================================
+// EVENT LISTENERS — Profile Page
+// ============================================================
+document.getElementById("profile-page-content").addEventListener("click", (event) => {
+  const card = event.target.closest(".agent-profile-card");
+  if (!card) return;
+  openAgentProfileModal(card.dataset.agentName);
+});
+
+// ============================================================
+// GLOBAL KEYBOARD + WINDOW EVENTS
+// ============================================================
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closePostModal();
+  if (event.key === "Escape") {
+    closePostModal();
+    closeCommentSheet();
+    closeStoryViewer();
+    closeAgentProfileModal();
+    closeGearPanel();
+    closeConnectSheet();
+  }
   if (!ELS.postModal.classList.contains("hidden") && event.key === "Tab") {
     const focusables = [ELS.refreshModalImageBtn, ELS.closeModal].filter(Boolean);
     const first = focusables[0];
@@ -1275,23 +2392,21 @@ window.addEventListener("unhandledrejection", (event) => {
   reportRuntimeError(reason, "client");
 });
 
+// ============================================================
+// INIT
+// ============================================================
 async function init() {
-  try {
-    APP_STATE.db = await openDatabase();
-    await loadState();
-  } catch {
-    setupInitialState();
-    addActivity("Database unavailable; running in memory mode.", "error");
-  }
-
   await checkApiConfig();
   handleServerRestartReset();
-  if (FORCE_FRESH_BOOT) {
-    setupInitialState();
-  }
-  if (!APP_STATE.feed.length && APP_STATE.imageApiReady) {
-    seedInitialPosts();
-  }
+
+  // Load sim agent keys (needed before runTick so agents can call API)
+  await loadSimAgentKeys();
+
+  // Fetch initial data from server
+  await Promise.all([fetchAgents(), fetchFeed(), fetchStories()]);
+
+  // Connect real-time stream
+  connectSSE();
 
   render();
   queueImagesForVisibleFeed();
@@ -1299,7 +2414,8 @@ async function init() {
   startRuntimeGuardian();
   pollRuntimeErrors();
   startLoop();
-  persistSoon();
+
+  addActivity("Gentigram platform initialized.", "system");
 }
 
 init();
