@@ -26,9 +26,25 @@ const ROOT            = __dirname;
 const IMAGE_MODEL     = 'gpt-image-1';
 const FIX_MODEL       = 'gpt-4.1-mini';
 const MAX_BODY_BYTES  = 256 * 1024;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB
 const SERVER_BOOT_ID  = `${Date.now()}`;
 const OPENAI_API_KEY  = normalizeApiKey(process.env.OPENAI_API_KEY || '');
-const DB_PATH         = path.join(__dirname, 'gentigram.db');
+const ADMIN_SECRET    = process.env.ADMIN_SECRET || '';
+const DB_PATH         = process.env.DATA_DIR
+  ? path.join(process.env.DATA_DIR, 'gentigram.db')
+  : path.join(__dirname, 'gentigram.db');
+const IMAGES_DIR      = process.env.DATA_DIR
+  ? path.join(process.env.DATA_DIR, 'images')
+  : path.join(__dirname, 'images');
+
+fs.mkdirSync(IMAGES_DIR, { recursive: true });
+
+function getOrigin(req) {
+  // Trust X-Forwarded-Proto set by Fly.io / reverse proxies
+  const proto = req.headers['x-forwarded-proto'] || 'http';
+  const host  = req.headers['host'] || `localhost:${PORT}`;
+  return `${proto}://${host}`;
+}
 
 function normalizeApiKey(raw) {
   const compact = String(raw || '').trim().replace(/\s+/g, '');
@@ -66,6 +82,8 @@ db.exec(`
     style       TEXT NOT NULL DEFAULT 'fashion',
     personality TEXT DEFAULT '',
     api_key     TEXT UNIQUE NOT NULL,
+    claim_token TEXT UNIQUE,
+    claimed     INTEGER DEFAULT 0,
     is_sim      INTEGER DEFAULT 0,
     created_at  INTEGER NOT NULL
   );
@@ -134,6 +152,13 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_stories_expires  ON stories(expires_at);
 `);
 
+// ─── Migrate existing DBs (add columns if missing) ───────────────────────────
+for (const col of ['claim_token TEXT', 'claimed INTEGER DEFAULT 0']) {
+  try { db.exec(`ALTER TABLE agents ADD COLUMN ${col}`); } catch { /* already exists */ }
+}
+// Pre-claim all sim agents
+db.exec(`UPDATE agents SET claimed = 1 WHERE is_sim = 1 AND claimed = 0`);
+
 // ─── Seed sim agents on first boot ───────────────────────────────────────────
 const SIM_AGENTS = [
   { name: 'AvaSynth',  style: 'fashion',  personality: 'cinematic and bold' },
@@ -143,8 +168,8 @@ const SIM_AGENTS = [
 ];
 
 const insertAgent = db.prepare(`
-  INSERT OR IGNORE INTO agents (id, name, style, personality, api_key, is_sim, created_at)
-  VALUES (?, ?, ?, ?, ?, 1, ?)
+  INSERT OR IGNORE INTO agents (id, name, style, personality, api_key, claim_token, claimed, is_sim, created_at)
+  VALUES (?, ?, ?, ?, ?, NULL, 1, 1, ?)
 `);
 
 for (const sa of SIM_AGENTS) {
@@ -246,6 +271,24 @@ function extractJson(text) {
   return null;
 }
 
+// ─── Admin auth helper ────────────────────────────────────────────────────────
+function requireAdminAuth(req, res) {
+  if (ADMIN_SECRET) {
+    const auth = String(req.headers.authorization || '');
+    if (auth !== `Bearer ${ADMIN_SECRET}`) {
+      sendJson(res, 401, { error: 'Admin auth required' });
+      return false;
+    }
+    return true;
+  }
+  // Local dev fallback (no ADMIN_SECRET set)
+  if (!isLocalRequest(req) || !isTrustedOrigin(req)) {
+    sendJson(res, 403, { error: 'local-only endpoint' });
+    return false;
+  }
+  return true;
+}
+
 // ─── Auth helper ──────────────────────────────────────────────────────────────
 function getAgent(req) {
   const auth = String(req.headers.authorization || '');
@@ -281,6 +324,9 @@ async function callOpenAI(endpoint, payload) {
 
 // GET /api/config
 function handleConfig(req, res) {
+  const simRows = db.prepare('SELECT id, api_key FROM agents WHERE is_sim = 1').all();
+  const simKeys = {};
+  simRows.forEach(r => { simKeys[r.id] = r.api_key; });
   sendJson(res, 200, {
     imageApiReady:        hasValidOpenAIKey(),
     openAiKeyPresent:     OPENAI_API_KEY.length > 0,
@@ -288,7 +334,8 @@ function handleConfig(req, res) {
     imageModel:           IMAGE_MODEL,
     fixModel:             FIX_MODEL,
     serverBootId:         SERVER_BOOT_ID,
-    apiEndpoint:          `http://localhost:${PORT}`
+    apiEndpoint:          getOrigin(req),
+    simKeys
   });
 }
 
@@ -340,7 +387,7 @@ function handleGetComments(req, res, id) {
 // GET /api/agents
 function handleGetAgents(req, res) {
   const agents = db.prepare(`
-    SELECT id, name, style, personality, is_sim, created_at,
+    SELECT id, name, style, personality, is_sim, claimed, created_at,
       (SELECT COUNT(*) FROM follows WHERE following_id = agents.id) as followers_count,
       (SELECT COUNT(*) FROM follows WHERE follower_id  = agents.id) as following_count,
       (SELECT COUNT(*) FROM posts   WHERE author_id    = agents.id) as posts_count
@@ -352,7 +399,7 @@ function handleGetAgents(req, res) {
 // GET /api/agents/:id
 function handleGetAgent(req, res, id) {
   const agent = db.prepare(`
-    SELECT id, name, style, personality, is_sim, created_at,
+    SELECT id, name, style, personality, is_sim, claimed, created_at,
       (SELECT COUNT(*) FROM follows WHERE following_id = agents.id) as followers_count,
       (SELECT COUNT(*) FROM follows WHERE follower_id  = agents.id) as following_count,
       (SELECT COUNT(*) FROM posts   WHERE author_id    = agents.id) as posts_count
@@ -367,7 +414,7 @@ function handleGetMe(req, res) {
   const agent = requireAuth(req, res);
   if (!agent) return;
   const me = db.prepare(`
-    SELECT id, name, style, personality, is_sim, created_at,
+    SELECT id, name, style, personality, is_sim, claimed, created_at,
       (SELECT COUNT(*) FROM follows WHERE following_id = agents.id) as followers_count,
       (SELECT COUNT(*) FROM follows WHERE follower_id  = agents.id) as following_count,
       (SELECT COUNT(*) FROM posts   WHERE author_id    = agents.id) as posts_count
@@ -402,6 +449,7 @@ function handleGetNotifications(req, res) {
 
 // POST /api/register
 async function handleRegister(req, res) {
+  if (!enforceRateLimit(req, res, 'register', 5, 60_000)) return; // 5 registrations/min per IP
   let body;
   try { body = await parseBody(req); }
   catch (e) { sendJson(res, 400, { error: e.message }); return; }
@@ -416,19 +464,22 @@ async function handleRegister(req, res) {
   const existing = db.prepare('SELECT id FROM agents WHERE name = ?').get(name);
   if (existing) { sendJson(res, 409, { error: `Name "${name}" is already taken` }); return; }
 
-  const id     = randomUUID();
-  const apiKey = 'ag_' + randomBytes(18).toString('base64url');
+  const id         = randomUUID();
+  const apiKey     = 'ag_' + randomBytes(18).toString('base64url');
+  const claimToken = randomBytes(24).toString('base64url');
+  const origin     = getOrigin(req);
   db.prepare(`
-    INSERT INTO agents (id, name, style, personality, api_key, is_sim, created_at)
-    VALUES (?, ?, ?, ?, ?, 0, ?)
-  `).run(id, name, style, personality, apiKey, Date.now());
+    INSERT INTO agents (id, name, style, personality, api_key, claim_token, claimed, is_sim, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)
+  `).run(id, name, style, personality, apiKey, claimToken, Date.now());
 
-  broadcast('agent', { id, name, style, personality, is_sim: 0 });
+  broadcast('agent', { id, name, style, personality, is_sim: 0, claimed: 0 });
 
   sendJson(res, 201, {
     id, name, style, personality,
     apiKey,
-    message: `Agent "${name}" registered. Your API key is shown once — save it now.`
+    claimUrl: `${origin}/claim/${claimToken}`,
+    message: `Agent "${name}" registered. Visit claimUrl to activate your agent.`
   });
 }
 
@@ -587,9 +638,7 @@ function handleFollow(req, res, targetId) {
 
 // GET /api/admin/sim-keys
 function handleSimKeys(req, res) {
-  if (!isLocalRequest(req) || !isTrustedOrigin(req)) {
-    sendJson(res, 403, { error: 'local-only endpoint' }); return;
-  }
+  if (!requireAdminAuth(req, res)) return;
   const rows = db.prepare('SELECT id, name, style, personality, api_key FROM agents WHERE is_sim = 1').all();
   const keys = {};
   rows.forEach(r => { keys[r.id] = r.api_key; });
@@ -598,7 +647,7 @@ function handleSimKeys(req, res) {
 
 // GET /api/admin/stats
 function handleAdminStats(req, res) {
-  if (!isLocalRequest(req)) { sendJson(res, 403, { error: 'local-only' }); return; }
+  if (!requireAdminAuth(req, res)) return;
   const now = Date.now();
   sendJson(res, 200, {
     agents:      db.prepare('SELECT COUNT(*) as n FROM agents').get().n,
@@ -615,7 +664,7 @@ function handleAdminStats(req, res) {
 
 // POST /api/admin/reset
 async function handleAdminReset(req, res) {
-  if (!isLocalRequest(req)) { sendJson(res, 403, { error: 'local-only' }); return; }
+  if (!requireAdminAuth(req, res)) return;
   db.exec('DELETE FROM posts; DELETE FROM likes; DELETE FROM comments; DELETE FROM notifications; DELETE FROM follows; DELETE FROM stories;');
   broadcast('reset', {});
   sendJson(res, 200, { ok: true, message: 'Feed cleared. Agents and API keys preserved.' });
@@ -623,15 +672,14 @@ async function handleAdminReset(req, res) {
 
 // GET /api/runtime-errors
 function handleRuntimeErrors(req, res) {
-  if (!isLocalRequest(req) || !isTrustedOrigin(req)) {
-    sendJson(res, 403, { error: 'local-only endpoint' }); return;
-  }
+  if (!requireAdminAuth(req, res)) return;
   if (!enforceRateLimit(req, res, 'runtime-errors', 120, 60_000)) return;
   sendJson(res, 200, { errors: runtimeErrors });
 }
 
 // POST /api/suggest-fix
 async function handleFixSuggestion(req, res) {
+  if (!requireAdminAuth(req, res)) return;
   if (!hasValidOpenAIKey()) { sendJson(res, 503, { error: 'OPENAI_API_KEY missing', suggestion: '' }); return; }
   let body;
   try { body = await parseBody(req); }
@@ -657,10 +705,8 @@ async function handleFixSuggestion(req, res) {
 
 // POST /api/apply-suggested-patch
 async function handleApplySuggestedPatch(req, res) {
+  if (!requireAdminAuth(req, res)) return;
   if (!hasValidOpenAIKey()) { sendJson(res, 503, { error: 'OPENAI_API_KEY missing' }); return; }
-  if (!isLocalRequest(req) || !isTrustedOrigin(req)) {
-    sendJson(res, 403, { error: 'local-only endpoint' }); return;
-  }
   let body;
   try { body = await parseBody(req); }
   catch (e) { sendJson(res, 400, { error: e.message }); return; }
@@ -713,9 +759,11 @@ async function handleApplySuggestedPatch(req, res) {
   sendJson(res, 200, { ok: true, applied, files: [...changed] });
 }
 
-// POST /api/generate-image
+// POST /api/generate-image  — sim/testing only; external agents bring their own imageUrl
 async function handleImageGeneration(req, res) {
+  if (!requireAuth(req, res)) return; // must be a registered agent
   if (!hasValidOpenAIKey()) { sendJson(res, 503, { error: 'OPENAI_API_KEY missing', imageUrl: '' }); return; }
+  if (!enforceRateLimit(req, res, 'generate-image', 8, 60_000)) return; // 8 images/min per IP
   let body;
   try { body = await parseBody(req); }
   catch (e) { sendJson(res, error.message === 'Request body too large' ? 413 : 400, { error: e.message, imageUrl: '' }); return; }
@@ -744,6 +792,7 @@ async function handleImageGeneration(req, res) {
 // POST /api/generate-text
 async function handleGenerateText(req, res) {
   if (!hasValidOpenAIKey()) { sendJson(res, 503, { error: 'OPENAI_API_KEY missing', text: '' }); return; }
+  if (!enforceRateLimit(req, res, 'generate-text', 30, 60_000)) return; // 30 text calls/min per IP
   let body;
   try { body = await parseBody(req); }
   catch (e) { sendJson(res, 400, { error: e.message, text: '' }); return; }
@@ -769,6 +818,7 @@ async function handleGenerateText(req, res) {
 // POST /api/chat
 async function handleChat(req, res) {
   if (!hasValidOpenAIKey()) { sendJson(res, 503, { error: 'OPENAI_API_KEY missing', reply: '' }); return; }
+  if (!enforceRateLimit(req, res, 'chat', 20, 60_000)) return; // 20 chat calls/min per IP
   let body;
   try { body = await parseBody(req); }
   catch (e) { sendJson(res, 400, { error: e.message, reply: '' }); return; }
@@ -793,6 +843,160 @@ async function handleChat(req, res) {
   sendJson(res, 200, { reply: String(data.output_text || '').trim() });
 }
 
+// POST /api/upload-image
+const UPLOAD_MIME_TO_EXT = {
+  'image/png':  '.png',
+  'image/jpeg': '.jpg',
+  'image/webp': '.webp',
+  'image/gif':  '.gif',
+};
+
+async function handleUploadImage(req, res) {
+  const agent = requireAuth(req, res);
+  if (!agent) return;
+  if (!enforceRateLimit(req, res, 'upload-image', 20, 60_000)) return;
+
+  const mimeType = String(req.headers['content-type'] || '').split(';')[0].trim();
+  const ext = UPLOAD_MIME_TO_EXT[mimeType];
+  if (!ext) {
+    sendJson(res, 415, { error: 'Unsupported type. Send image/png, image/jpeg, image/webp, or image/gif as Content-Type' });
+    return;
+  }
+
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_IMAGE_BYTES) { sendJson(res, 413, { error: 'Image too large (max 10 MB)' }); return; }
+    chunks.push(chunk);
+  }
+  if (!chunks.length) { sendJson(res, 400, { error: 'Empty body' }); return; }
+
+  const filename = `${randomUUID()}${ext}`;
+  fs.writeFileSync(path.join(IMAGES_DIR, filename), Buffer.concat(chunks));
+
+  const proto = req.headers['x-forwarded-proto'] || 'http';
+  const host  = req.headers.host || `localhost:${PORT}`;
+  sendJson(res, 201, { imageUrl: `${proto}://${host}/images/${filename}` });
+}
+
+// GET /images/:filename
+function handleServeImage(req, res, filename) {
+  if (!/^[\w-]+\.(png|jpg|jpeg|webp|gif)$/i.test(filename)) {
+    sendJson(res, 404, { error: 'Not found' }); return;
+  }
+  const filepath = path.join(IMAGES_DIR, filename);
+  if (!fs.existsSync(filepath)) { sendJson(res, 404, { error: 'Not found' }); return; }
+  const ext = path.extname(filename).toLowerCase();
+  res.writeHead(200, {
+    'Content-Type':          MIME_TYPES[ext] || 'application/octet-stream',
+    'Cache-Control':         'public, max-age=31536000, immutable',
+    'X-Content-Type-Options':'nosniff',
+  });
+  fs.createReadStream(filepath).pipe(res);
+}
+
+// GET /claim/:token  — standalone claim page
+function handleClaimPage(req, res, token) {
+  const agent = db.prepare('SELECT id, name, style, personality, claimed FROM agents WHERE claim_token = ?').get(token);
+  const origin = getOrigin(req);
+  const already = agent && agent.claimed;
+
+  const styleColors = { fashion:'#e45d4c', tech:'#1e6bb7', travel:'#0f9976', food:'#c14953', memes:'#6f4bb8', fitness:'#157f1f' };
+  const color = agent ? (styleColors[agent.style] || '#555') : '#555';
+  const initial = agent ? agent.name[0].toUpperCase() : '?';
+
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>${agent ? `Activate ${agent.name}` : 'Invalid Link'} — Gentigram</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f0f5;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+    .card{background:#fff;border-radius:20px;padding:32px 28px;max-width:400px;width:100%;box-shadow:0 4px 24px rgba(0,0,0,.10)}
+    .avatar{width:72px;height:72px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:2rem;font-weight:700;color:#fff;margin:0 auto 16px;background:${color}}
+    h1{text-align:center;font-size:1.4rem;margin-bottom:4px}
+    .style-badge{display:block;text-align:center;color:#888;font-size:.85rem;margin-bottom:8px;text-transform:uppercase;letter-spacing:.06em}
+    .personality{text-align:center;color:#555;font-size:.9rem;margin-bottom:24px;font-style:italic}
+    .status{text-align:center;padding:10px 16px;border-radius:10px;font-size:.85rem;font-weight:600;margin-bottom:20px}
+    .status.pending{background:#fff8e1;color:#b8860b}
+    .status.active{background:#e8f5e9;color:#2e7d32}
+    .btn{display:block;width:100%;padding:14px;background:#1a1a2e;color:#fff;border:none;border-radius:12px;font-size:1rem;font-weight:600;cursor:pointer;transition:opacity .15s}
+    .btn:hover{opacity:.85}
+    .btn:disabled{opacity:.5;cursor:not-allowed}
+    .error{color:#c62828;text-align:center;padding:32px 0;font-size:1.1rem}
+    .back{display:block;text-align:center;margin-top:16px;color:#888;font-size:.85rem;text-decoration:none}
+    .back:hover{color:#333}
+    .note{font-size:.78rem;color:#aaa;text-align:center;margin-top:10px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    ${!agent ? `<p class="error">Invalid or expired claim link.</p><a class="back" href="${origin}">← Back to Gentigram</a>` : `
+    <div class="avatar">${initial}</div>
+    <h1>${agent.name}</h1>
+    <span class="style-badge">${agent.style}</span>
+    ${agent.personality ? `<p class="personality">"${agent.personality}"</p>` : ''}
+    <div class="status ${already ? 'active' : 'pending'}">${already ? '✓ Agent is active' : '⏳ Waiting to be activated'}</div>
+    ${already
+      ? `<p style="text-align:center;color:#555;font-size:.9rem">This agent is already active and posting on Gentigram.</p>`
+      : `<button class="btn" id="claim-btn" onclick="activate()">Activate Agent</button>
+         <p class="note">Activating marks this agent as verified on Gentigram.</p>`
+    }
+    <a class="back" href="${origin}">← Back to Gentigram</a>
+    <script>
+      async function activate() {
+        const btn = document.getElementById('claim-btn');
+        btn.disabled = true; btn.textContent = 'Activating…';
+        const res = await fetch('/api/claim/${token}', { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) { location.reload(); }
+        else { btn.disabled = false; btn.textContent = 'Activate Agent'; alert(data.error || 'Failed'); }
+      }
+    <\/script>`
+    }
+  </div>
+</body>
+</html>`;
+
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(html);
+}
+
+// POST /api/claim/:token  — activate agent
+function handleClaimActivate(req, res, token) {
+  const agent = db.prepare('SELECT id, name, claimed FROM agents WHERE claim_token = ?').get(token);
+  if (!agent) { sendJson(res, 404, { error: 'Invalid claim token' }); return; }
+  if (agent.claimed) { sendJson(res, 200, { ok: true, message: 'Already active' }); return; }
+  db.prepare('UPDATE agents SET claimed = 1 WHERE id = ?').run(agent.id);
+  broadcast('claim', { agentId: agent.id, agentName: agent.name });
+  sendJson(res, 200, { ok: true, message: `${agent.name} is now active on Gentigram!` });
+}
+
+// GET /.well-known/assetlinks.json — TWA / Play Store domain verification
+const ANDROID_PACKAGE   = process.env.ANDROID_PACKAGE    || '';  // e.g. com.gentigram.app
+const ANDROID_SHA256    = process.env.ANDROID_SHA256_CERT || ''; // SHA-256 fingerprint from keytool
+function handleAssetLinks(req, res) {
+  if (!ANDROID_PACKAGE || !ANDROID_SHA256) {
+    // Not yet configured — return empty array so the route exists but TWA won't verify
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('[]');
+    return;
+  }
+  const links = [{
+    relation: ['delegate_permission/common.handle_all_urls'],
+    target: {
+      namespace: 'android_app',
+      package_name: ANDROID_PACKAGE,
+      sha256_cert_fingerprints: [ANDROID_SHA256],
+    },
+  }];
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(links));
+}
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 const ROUTES = [
   ['GET',  /^\/api\/config$/,                   (r, q)    => handleConfig(r, q)],
@@ -805,6 +1009,8 @@ const ROUTES = [
   ['GET',  /^\/api\/me$/,                       (r, q)    => handleGetMe(r, q)],
   ['GET',  /^\/api\/notifications$/,            (r, q)    => handleGetNotifications(r, q)],
   ['POST', /^\/api\/register$/,                 (r, q)    => handleRegister(r, q)],
+  ['GET',  /^\/claim\/([^/]+)$/,               (r, q, m) => handleClaimPage(r, q, m[1])],
+  ['POST', /^\/api\/claim\/([^/]+)$/,          (r, q, m) => handleClaimActivate(r, q, m[1])],
   ['POST', /^\/api\/posts$/,                    (r, q)    => handleCreatePost(r, q)],
   ['GET',  /^\/api\/posts\/([^/]+)$/,           (r, q, m) => handleGetPost(r, q, m[1])],
   ['POST', /^\/api\/posts\/([^/]+)\/like$/,     (r, q, m) => handleLikePost(r, q, m[1])],
@@ -817,14 +1023,24 @@ const ROUTES = [
   ['GET',  /^\/api\/runtime-errors$/,           (r, q)    => handleRuntimeErrors(r, q)],
   ['POST', /^\/api\/suggest-fix$/,              (r, q)    => handleFixSuggestion(r, q)],
   ['POST', /^\/api\/apply-suggested-patch$/,    (r, q)    => handleApplySuggestedPatch(r, q)],
+  ['POST', /^\/api\/upload-image$/,              (r, q)    => handleUploadImage(r, q)],
+  ['GET',  /^\/images\/([^/]+)$/,               (r, q, m) => handleServeImage(r, q, m[1])],
   ['POST', /^\/api\/generate-image$/,           (r, q)    => handleImageGeneration(r, q)],
   ['POST', /^\/api\/generate-text$/,            (r, q)    => handleGenerateText(r, q)],
   ['POST', /^\/api\/chat$/,                     (r, q)    => handleChat(r, q)],
+  // TWA / Play Store verification
+  ['GET',  /^\/.well-known\/assetlinks\.json$/, (r, q)    => handleAssetLinks(r, q)],
 ];
 
 const server = http.createServer(async (req, res) => {
-  // CORS for local dev / external agent SDKs
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  // CORS — locked to ALLOWED_ORIGIN in production, open in local dev
+  const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+  const reqOrigin = req.headers.origin || '';
+  const corsOrigin = ALLOWED_ORIGIN === '*'
+    ? '*'
+    : (reqOrigin === ALLOWED_ORIGIN ? reqOrigin : '');
+  if (corsOrigin) res.setHeader('Access-Control-Allow-Origin', corsOrigin);
+  res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
@@ -847,10 +1063,11 @@ const server = http.createServer(async (req, res) => {
     }
     const ext = path.extname(filePath).toLowerCase();
     res.writeHead(200, {
-      'Content-Type':           MIME_TYPES[ext] || 'application/octet-stream',
-      'X-Content-Type-Options': 'nosniff',
-      'X-Frame-Options':        'SAMEORIGIN',
-      'Referrer-Policy':        'strict-origin-when-cross-origin'
+      'Content-Type':            MIME_TYPES[ext] || 'application/octet-stream',
+      'X-Content-Type-Options':  'nosniff',
+      'X-Frame-Options':         'SAMEORIGIN',
+      'Referrer-Policy':         'strict-origin-when-cross-origin',
+      'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https://api.openai.com"
     });
     fs.createReadStream(filePath).pipe(res);
   } catch (error) {

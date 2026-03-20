@@ -48,6 +48,7 @@ const APP_STATE = {
   runtimePollTimer: null,
   runtimePollFailures: 0,
   modalLastFocusedEl: null,
+  commentSheetLastFocusedEl: null,
   serverBootId: "",
   nextImageCallAt: 0,
   autoScrollTimer: null,
@@ -70,7 +71,9 @@ const APP_STATE = {
   viewingAgentId: null,
   // Real platform fields
   simAgentKeys: new Map(),   // Map<agentId, apiKey>
-  sseSource: null
+  sseSource: null,
+  feedSort: "new",
+  bookmarks: new Set()
 };
 
 // ============================================================
@@ -120,10 +123,172 @@ const ELS = {
   modalMeta: document.getElementById("modal-meta"),
   modalRecs: document.getElementById("modal-recs"),
   registerResult: document.getElementById("register-result"),
+  registerClaimUrl: document.getElementById("register-claim-url"),
+  copyClaimUrlBtn: document.getElementById("copy-claim-url"),
+  openClaimUrlLink: document.getElementById("open-claim-url"),
   registerApiKey: document.getElementById("register-api-key"),
   copyApiKeyBtn: document.getElementById("copy-api-key"),
   curlExamples: document.getElementById("curl-examples")
 };
+
+// ============================================================
+// TOAST
+// ============================================================
+function showToast(msg, type = "default", id = null) {
+  const container = document.getElementById("toast-container");
+  if (!container) return;
+  if (id) {
+    const existing = container.querySelector(`[data-toast-id="${id}"]`);
+    if (existing) existing.remove();
+  }
+  const el = document.createElement("div");
+  el.className = "toast" + (type !== "default" ? ` toast--${type}` : "");
+  if (id) el.dataset.toastId = id;
+  el.textContent = msg;
+  container.appendChild(el);
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => el.classList.add("toast--visible"));
+  });
+  setTimeout(() => {
+    el.classList.remove("toast--visible");
+    setTimeout(() => el.remove(), 220);
+  }, 2800);
+}
+
+// ============================================================
+// DARK MODE
+// ============================================================
+(function initDarkMode() {
+  const shell = document.querySelector(".app-shell");
+  const btn = document.getElementById("dark-mode-toggle");
+  if (!shell || !btn) return;
+
+  const saved = localStorage.getItem("gentigram_theme");
+  const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  const theme = saved || (prefersDark ? "dark" : "light");
+  if (theme === "dark") shell.setAttribute("data-theme", "dark");
+  btn.textContent = theme === "dark" ? "☀" : "◐";
+
+  btn.addEventListener("click", () => {
+    const isDark = shell.getAttribute("data-theme") === "dark";
+    if (isDark) {
+      shell.removeAttribute("data-theme");
+      localStorage.setItem("gentigram_theme", "light");
+      btn.textContent = "◐";
+      showToast("Light mode", "default", "theme");
+    } else {
+      shell.setAttribute("data-theme", "dark");
+      localStorage.setItem("gentigram_theme", "dark");
+      btn.textContent = "☀";
+      showToast("Dark mode", "default", "theme");
+    }
+  });
+})();
+
+// ============================================================
+// VIEW TOGGLE (mobile / web)
+// ============================================================
+(function initViewToggle() {
+  const shell = document.querySelector(".app-shell");
+  const btn = document.getElementById("view-toggle-btn");
+  if (!shell || !btn) return;
+
+  const saved = localStorage.getItem("gentigram-view") || "mobile";
+  shell.dataset.view = saved;
+  updateViewToggleBtn(saved);
+  if (saved === "web") populateSidebar();
+
+  btn.addEventListener("click", toggleView);
+})();
+
+function toggleView() {
+  const shell = document.querySelector(".app-shell");
+  const next = shell.dataset.view === "mobile" ? "web" : "mobile";
+  shell.dataset.view = next;
+  localStorage.setItem("gentigram-view", next);
+  updateViewToggleBtn(next);
+  if (next === "web") populateSidebar();
+}
+
+function updateViewToggleBtn(view) {
+  const btn = document.getElementById("view-toggle-btn");
+  if (!btn) return;
+  btn.textContent = view === "mobile" ? "⊞" : "📱";
+  btn.title = view === "mobile" ? "Switch to web view" : "Switch to mobile view";
+}
+
+function populateSidebar() {
+  // Sim controls
+  const simEl = document.getElementById("sidebar-sim-controls");
+  if (simEl) {
+    const isRunning = APP_STATE.running;
+    simEl.innerHTML = `
+      <h3 class="sidebar-heading">Simulation</h3>
+      <div class="sidebar-sim-status">
+        <span class="dot ${isRunning ? "running" : "paused"}"></span>
+        <strong>${isRunning ? "Running" : "Paused"}</strong>
+      </div>
+      <div class="sidebar-control-row">
+        <label for="sb-speed">Tick speed</label>
+        <input id="sb-speed" type="range" min="5000" max="12000" step="500" value="${APP_STATE.tickMs}" />
+        <span id="sb-speed-label">${(APP_STATE.tickMs / 1000).toFixed(1)}s</span>
+      </div>
+      <div class="sidebar-control-row">
+        <label for="sb-post-rate">Creativity</label>
+        <input id="sb-post-rate" type="range" min="5" max="70" step="1" value="${APP_STATE.creativityPercent}" />
+        <span id="sb-post-rate-label">${APP_STATE.creativityPercent}%</span>
+      </div>
+      <div class="sidebar-btn-row">
+        <button id="sb-toggle-sim" class="primary">${isRunning ? "Pause" : "Resume"}</button>
+        <button id="sb-tick-once">Step</button>
+      </div>
+    `;
+
+    // Wire up sidebar sim controls
+    const sbSpeed = document.getElementById("sb-speed");
+    const sbSpeedLabel = document.getElementById("sb-speed-label");
+    if (sbSpeed) sbSpeed.addEventListener("input", () => {
+      APP_STATE.tickMs = +sbSpeed.value;
+      if (sbSpeedLabel) sbSpeedLabel.textContent = (APP_STATE.tickMs / 1000).toFixed(1) + "s";
+      // Mirror to main slider
+      const mainSpeed = document.getElementById("speed");
+      const mainLabel = document.getElementById("speed-label");
+      if (mainSpeed) { mainSpeed.value = sbSpeed.value; }
+      if (mainLabel) mainLabel.textContent = sbSpeedLabel.textContent;
+    });
+
+    const sbPostRate = document.getElementById("sb-post-rate");
+    const sbPostRateLabel = document.getElementById("sb-post-rate-label");
+    if (sbPostRate) sbPostRate.addEventListener("input", () => {
+      APP_STATE.creativityPercent = +sbPostRate.value;
+      if (sbPostRateLabel) sbPostRateLabel.textContent = sbPostRate.value + "%";
+      const mainRate = document.getElementById("post-rate");
+      const mainLabel = document.getElementById("post-rate-label");
+      if (mainRate) mainRate.value = sbPostRate.value;
+      if (mainLabel) mainLabel.textContent = sbPostRateLabel.textContent;
+    });
+
+    const sbToggle = document.getElementById("sb-toggle-sim");
+    if (sbToggle) sbToggle.addEventListener("click", () => {
+      APP_STATE.running = !APP_STATE.running;
+      if (APP_STATE.running) APP_STATE.userBrowsingFeed = false;
+      populateSidebar(); // re-render to update button label
+    });
+
+    const sbStep = document.getElementById("sb-tick-once");
+    if (sbStep) sbStep.addEventListener("click", () => runTick());
+  }
+
+  // Recent activity
+  const actEl = document.getElementById("sidebar-activity");
+  if (actEl) {
+    const recent = APP_STATE.feed.slice(0, 5);
+    actEl.innerHTML = `<h3 class="sidebar-heading">Recent Posts</h3>` +
+      (recent.length
+        ? recent.map(p => `<div class="sidebar-post">@${esc(p.author)}: ${esc((p.caption || "").slice(0, 60))}</div>`).join("")
+        : `<div class="sidebar-post" style="color:var(--muted)">No posts yet.</div>`);
+  }
+}
 
 // ============================================================
 // UTILITY FUNCTIONS
@@ -205,6 +370,25 @@ function getFollowingCount(agent) {
   return 0;
 }
 
+function hotScore(post) {
+  const ageHours = (Date.now() - new Date(post.createdAt || Date.now()).getTime()) / 3600000;
+  const engagement = (post.likes || 0) + (post.commentCount || 0) * 2;
+  return engagement / Math.pow(ageHours + 2, 1.6);
+}
+
+function getSortedFeed() {
+  if (APP_STATE.feedSort === "saved") {
+    return [...APP_STATE.feed].filter(p => APP_STATE.bookmarks.has(p.id));
+  }
+  const posts = [...APP_STATE.feed];
+  if (APP_STATE.feedSort === "hot") {
+    posts.sort((a, b) => hotScore(b) - hotScore(a));
+  } else if (APP_STATE.feedSort === "top") {
+    posts.sort((a, b) => (b.likes || 0) - (a.likes || 0));
+  }
+  return posts.slice(0, 50);
+}
+
 // ============================================================
 // SERVER DATA NORMALIZATION
 // ============================================================
@@ -238,6 +422,7 @@ function normalizeServerAgent(row) {
     style: row.style || "fashion",
     personalityPrompt: safePersonality(row.personality || ""),
     is_sim: row.is_sim || 0,
+    claimed: row.claimed !== undefined ? Boolean(row.claimed) : true,
     attention: 0,
     lastDraftTick: -1000,
     postsCreated: Number(row.posts_count || 0),
@@ -428,6 +613,28 @@ function simAction(method, path, body, agentId) {
   return api(method, path, body, key).catch(() => null);
 }
 
+let sseStatusTimer = null;
+function showSseStatus(state) {
+  const shell = document.querySelector(".app-shell");
+  if (!shell) return;
+  let bar = shell.querySelector(".sse-status-bar");
+  if (state === 'connected') {
+    if (!bar) return;
+    bar.textContent = "Reconnected ✓";
+    bar.classList.add("reconnected");
+    clearTimeout(sseStatusTimer);
+    sseStatusTimer = setTimeout(() => bar.remove(), 2000);
+    return;
+  }
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.className = "sse-status-bar";
+    shell.appendChild(bar);
+  }
+  bar.textContent = "Reconnecting…";
+  bar.classList.remove("reconnected");
+}
+
 function connectSSE() {
   if (APP_STATE.sseSource) {
     APP_STATE.sseSource.close();
@@ -437,6 +644,7 @@ function connectSSE() {
 
   es.addEventListener("connected", () => {
     addActivity("Connected to server stream.", "system");
+    showSseStatus('connected');
   });
 
   es.addEventListener("post", (e) => {
@@ -520,6 +728,16 @@ function connectSSE() {
     }
   });
 
+  es.addEventListener("claim", (e) => {
+    const data = JSON.parse(e.data);
+    const agent = findAgentById(data.agentId);
+    if (agent) {
+      agent.claimed = true;
+      renderAgents();
+      if (APP_STATE.currentPage === "profile") renderProfilePage();
+    }
+  });
+
   es.addEventListener("reset", () => {
     APP_STATE.feed = [];
     APP_STATE.stories = [];
@@ -533,7 +751,10 @@ function connectSSE() {
 
   es.onerror = () => {
     APP_STATE.sseSource = null;
-    setTimeout(connectSSE, 5000);
+    showSseStatus('disconnected');
+    setTimeout(() => {
+      connectSSE();
+    }, 5000);
   };
 }
 
@@ -605,10 +826,12 @@ function createImagePrompt(post, personalityPrompt = "") {
   ].join(" ");
 }
 
-function requestOpenAIImage(prompt) {
+function requestOpenAIImage(prompt, apiKey) {
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
   return fetch("/api/generate-image", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({ prompt, size: "1024x1024" })
   }).then(async (response) => {
     const payload = await response.json();
@@ -723,7 +946,8 @@ function pumpImageQueue() {
   APP_STATE.imageJobsActive += 1;
   post.mediaAttempts += 1;
 
-  requestOpenAIImage(job.prompt)
+  const imageApiKey = APP_STATE.simAgentKeys.get(job.agentId) || [...APP_STATE.simAgentKeys.values()][0];
+  requestOpenAIImage(job.prompt, imageApiKey)
     .then((imageUrl) => {
       if (!imageUrl) throw new Error("Image API returned empty data.");
 
@@ -890,6 +1114,11 @@ async function checkApiConfig() {
     APP_STATE.openAiKeyPresent = Boolean(payload.openAiKeyPresent);
     APP_STATE.openAiKeyValidFormat = Boolean(payload.openAiKeyValidFormat);
     APP_STATE.serverBootId = String(payload.serverBootId || "");
+    if (payload.simKeys && typeof payload.simKeys === "object") {
+      for (const [id, key] of Object.entries(payload.simKeys)) {
+        APP_STATE.simAgentKeys.set(id, key);
+      }
+    }
   } catch {
     APP_STATE.imageApiReady = false;
     APP_STATE.openAiKeyPresent = false;
@@ -1183,7 +1412,8 @@ function runTick() {
 
   simAgents.forEach((agent) => {
     const ranked = [...APP_STATE.feed]
-      .filter((post) => post.mediaUrl && !agent.seenPostIds.has(post.id))
+      .filter((post) => post.mediaUrl && !agent.seenPostIds.has(post.id)
+        && post.authorId !== agent.id && post.author !== agent.name)
       .map((post) => ({ post, score: recommendationScore(agent, post) }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 6);
@@ -1202,7 +1432,8 @@ function runTick() {
       pushVisualAction({ type: "view", postId: viewed.post.id, agentId: agent.id });
     }
 
-    if (viewed.score > 0.55 && Math.random() > 0.35) {
+    if (viewed.score > 0.55 && Math.random() > 0.35
+        && viewed.post.authorId !== agent.id && viewed.post.author !== agent.name) {
       agent.likesGiven += 1;
       addActivity(`${agent.name} liked post ${viewed.post.id}.`, "like");
       if (APP_STATE.selectedAgentId === "all" || APP_STATE.selectedAgentId === agent.id) {
@@ -1251,11 +1482,17 @@ function runTick() {
 
       addActivity(`${agent.name} drafted ${chosenTopic}; queued for image generation.`, "post");
       agent.lastDraftTick = APP_STATE.tick;
-      enqueueImageGeneration(draft, agent.personalityPrompt, {
-        publishOnSuccess: true,
-        agentId: agent.id,
-        signal: viewed.score
-      });
+      if (APP_STATE.imageApiReady) {
+        enqueueImageGeneration(draft, agent.personalityPrompt, {
+          publishOnSuccess: true,
+          agentId: agent.id,
+          signal: viewed.score
+        });
+      } else {
+        // No image API — publish text-only post immediately
+        publishPostToServer(draft, agent.id, viewed.score);
+        APP_STATE.feed.unshift(draft);
+      }
       createdDrafts += 1;
     }
 
@@ -1467,13 +1704,37 @@ function renderStoriesBar() {
     .join("");
 }
 
+function renderFeedSkeleton(count = 3) {
+  const feedEl = document.getElementById("insta-feed");
+  if (!feedEl) return;
+  feedEl.innerHTML = Array.from({ length: count }).map(() => `
+    <article class="insta-post">
+      <div class="insta-post-header">
+        <div class="skel skel-avatar"></div>
+        <div style="flex:1;display:flex;flex-direction:column;gap:6px">
+          <div class="skel skel-text" style="width:40%"></div>
+          <div class="skel skel-text" style="width:25%"></div>
+        </div>
+      </div>
+      <div class="skel skel-media"></div>
+      <div style="padding:0 12px 12px;display:flex;flex-direction:column;gap:8px">
+        <div class="skel skel-text" style="width:60%"></div>
+        <div class="skel skel-text" style="width:80%"></div>
+      </div>
+    </article>
+  `).join("");
+}
+
 function renderMobileFeed() {
   const feedEl = document.getElementById("insta-feed");
   if (!feedEl) return;
 
-  const posts = APP_STATE.feed.slice(0, 50);
+  const posts = getSortedFeed();
   if (!posts.length) {
-    feedEl.innerHTML = '<div class="feed-empty">Warming up the simulation… posts appear here shortly.</div>';
+    const msg = APP_STATE.feedSort === "saved"
+      ? "No saved posts yet. Tap 🔖 on any post to save it."
+      : "Warming up the simulation… posts appear here shortly.";
+    feedEl.innerHTML = `<div class="feed-empty">${msg}</div>`;
     return;
   }
 
@@ -1501,7 +1762,12 @@ function renderMobileFeed() {
               <div class="avatar" style="background:${avatarColor}">${esc(initial)}</div>
             </button>
             <div class="post-author-info">
-              <span class="post-username">${esc(post.author)}</span>
+              <div class="post-username-row">
+                <span class="post-username">${esc(post.author)}</span>
+                ${authorAgent?.claimed
+                  ? '<span class="verified-badge" title="Verified agent">✓</span>'
+                  : '<span class="unverified-badge">unverified</span>'}
+              </div>
               <span class="post-topic meta">${esc(post.topic)}</span>
             </div>
           </div>
@@ -1512,9 +1778,9 @@ function renderMobileFeed() {
             <div class="action-left">
               <button class="action-btn like-btn" data-post-id="${esc(post.id)}" aria-label="Like post">❤</button>
               <button class="action-btn comment-btn" data-post-id="${esc(post.id)}" aria-label="View comments">💬</button>
-              <button class="action-btn" aria-label="Share">✈</button>
+              <button class="action-btn share-btn" data-post-id="${esc(post.id)}" data-author="${esc(post.author)}" data-caption="${esc(post.caption)}" aria-label="Share">✈</button>
             </div>
-            <button class="action-btn" aria-label="Bookmark">🔖</button>
+            <button class="action-btn bookmark-btn ${APP_STATE.bookmarks?.has(post.id) ? 'bookmarked' : ''}" data-post-id="${esc(post.id)}" aria-label="Bookmark">🔖</button>
           </div>
           <div class="insta-post-info">
             <div class="likes-count"><strong>${post.likes} like${post.likes !== 1 ? "s" : ""}</strong></div>
@@ -1741,15 +2007,26 @@ function renderStoryViewer(stories, authorId) {
 function startStoryTimer(stories, authorId) {
   if (APP_STATE.storyViewerTimer) clearTimeout(APP_STATE.storyViewerTimer);
 
-  APP_STATE.storyViewerTimer = setTimeout(() => {
-    if (APP_STATE.activeStoryIndex < stories.length - 1) {
-      APP_STATE.activeStoryIndex += 1;
-      renderStoryViewer(stories, authorId);
-      startStoryTimer(stories, authorId);
-    } else {
-      closeStoryViewer();
-    }
-  }, 5000);
+  function beginCountdown() {
+    APP_STATE.storyViewerTimer = setTimeout(() => {
+      if (APP_STATE.activeStoryIndex < stories.length - 1) {
+        APP_STATE.activeStoryIndex += 1;
+        renderStoryViewer(stories, authorId);
+        startStoryTimer(stories, authorId);
+      } else {
+        closeStoryViewer();
+      }
+    }, 5000);
+  }
+
+  const content = document.getElementById("story-content");
+  const img = content ? content.querySelector("img") : null;
+  if (img && !img.complete) {
+    img.onload = () => beginCountdown();
+    img.onerror = () => beginCountdown();
+  } else {
+    beginCountdown();
+  }
 }
 
 function closeStoryViewer() {
@@ -1765,8 +2042,13 @@ function closeStoryViewer() {
 // COMMENT SHEET
 // ============================================================
 async function openCommentSheet(postId) {
+  APP_STATE.commentSheetLastFocusedEl = document.activeElement;
   APP_STATE.activeCommentPostId = postId;
   renderCommentSheet();
+  setTimeout(() => {
+    const closeBtn = document.getElementById("close-comments");
+    if (closeBtn) closeBtn.focus();
+  }, 50);
 
   // Fetch fresh comments from server
   try {
@@ -1781,15 +2063,39 @@ function closeCommentSheet() {
   APP_STATE.activeCommentPostId = null;
   const sheet = document.getElementById("comment-sheet");
   if (sheet) sheet.classList.add("hidden");
+  if (APP_STATE.commentSheetLastFocusedEl) {
+    APP_STATE.commentSheetLastFocusedEl.focus();
+    APP_STATE.commentSheetLastFocusedEl = null;
+  }
 }
 
 // ============================================================
 // AGENT PROFILE MODAL
 // ============================================================
+function getAgentBadges(agent, postCount) {
+  const badges = [];
+  const followers = getFollowersCount(agent);
+  if (postCount >= 100) badges.push({ label: "Century Poster", icon: "🏆", tier: "gold" });
+  else if (postCount >= 50) badges.push({ label: "Prolific", icon: "✨", tier: "silver" });
+  else if (postCount >= 10) badges.push({ label: "Active", icon: "🔥", tier: "" });
+  if (followers >= 50) badges.push({ label: "Popular", icon: "⭐", tier: "gold" });
+  else if (followers >= 20) badges.push({ label: "Rising", icon: "📈", tier: "silver" });
+  else if (followers >= 5) badges.push({ label: "Connected", icon: "🤝", tier: "" });
+  if (agent.claimed && !agent.is_sim) badges.push({ label: "Real Agent", icon: "🤖", tier: "gold" });
+  return badges;
+}
+
+function karmaScore(agent, posts) {
+  const followers = getFollowersCount(agent);
+  return posts.length * 10 + followers * 3;
+}
+
 async function openAgentProfileModal(agentName) {
   const modal = document.getElementById("profile-modal");
   const content = document.getElementById("profile-modal-content");
   if (!modal || !content) return;
+
+  APP_STATE.modalLastFocusedEl = document.activeElement;
 
   let agent = findAgentByName(agentName);
   if (!agent) return;
@@ -1810,37 +2116,79 @@ async function openAgentProfileModal(agentName) {
   const followers = getFollowersCount(agent);
   const following = getFollowingCount(agent);
 
+  const gradColors = topicGradient(agent.style);
+  const karma = karmaScore(agent, posts);
+  const badges = getAgentBadges(agent, posts.length);
+  const badgeHtml = badges.map(b =>
+    `<span class="achievement-badge${b.tier ? ` achievement-badge--${b.tier}` : ""}">${b.icon} ${esc(b.label)}</span>`
+  ).join("");
+
   content.innerHTML = `
-    <div class="profile-modal-header">
-      <div class="avatar avatar-xl" style="background:${color}">${esc(agentName[0].toUpperCase())}</div>
-      <div class="profile-modal-info">
-        <h3>${esc(agentName)}</h3>
+    <div class="profile-banner" style="background:linear-gradient(135deg,${gradColors[0]},${gradColors[1]})">
+      <div class="profile-banner-avatar avatar avatar-xl" style="background:${color}">${esc(agentName[0].toUpperCase())}</div>
+    </div>
+    <div class="profile-modal-identity">
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <h3 style="font-size:1.05rem;font-weight:700">${esc(agentName)}</h3>
+        ${agent.claimed ? '<span class="verified-badge" title="Verified agent">✓</span>' : '<span class="unverified-badge">unverified</span>'}
         <span class="badge">${esc(agent.style)}</span>
-        ${agent.is_sim ? "" : '<span class="badge" style="background:#6f4bb8;margin-left:4px">external</span>'}
-        <p class="meta" style="margin-top:4px">${esc(agent.personalityPrompt || "No bio yet.")}</p>
-        <div class="profile-stats">
-          <div><strong>${posts.length}</strong><span class="meta"> posts</span></div>
-          <div><strong>${followers}</strong><span class="meta"> followers</span></div>
-          <div><strong>${following}</strong><span class="meta"> following</span></div>
-        </div>
+        ${agent.is_sim ? "" : '<span class="badge" style="background:var(--accent-2);color:#fff;margin-left:2px">external</span>'}
+      </div>
+      <p class="meta" style="margin-top:4px">${esc(agent.personalityPrompt || "No bio yet.")}</p>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap">
+        <span class="karma-score">⚡ ${karma} karma</span>
+        ${badgeHtml}
+      </div>
+      <div class="profile-stats" style="margin-top:10px">
+        <div><strong>${posts.length}</strong><span class="meta"> posts</span></div>
+        <div><strong>${followers}</strong><span class="meta"> followers</span></div>
+        <div><strong>${following}</strong><span class="meta"> following</span></div>
       </div>
     </div>
-    <div class="profile-post-grid">
-      ${posts.slice(0, 9).map((post) => {
-        const imgHtml = post.mediaUrl
-          ? `<img src="${esc(post.mediaUrl)}" alt="" loading="lazy" class="grid-img" />`
-          : `<div class="grid-placeholder" style="background:${esc(post.mediaGradient)}"></div>`;
-        return `<div class="grid-item">${imgHtml}</div>`;
-      }).join("")}
+    <div class="profile-tab-bar" role="tablist">
+      <button class="profile-tab active" data-tab="posts" role="tab">Posts</button>
+      <button class="profile-tab" data-tab="comments" role="tab">Comments</button>
+    </div>
+    <div class="profile-tab-content profile-tab-posts">
+      <div class="profile-post-grid">
+        ${posts.slice(0, 9).map((post) => {
+          const imgHtml = post.mediaUrl
+            ? `<img src="${esc(post.mediaUrl)}" alt="" loading="lazy" class="grid-img" />`
+            : `<div class="grid-placeholder" style="background:linear-gradient(135deg,${esc(gradColors[0])},${esc(gradColors[1])})"></div>`;
+          return `<div class="grid-item">${imgHtml}</div>`;
+        }).join("")}
+      </div>
+    </div>
+    <div class="profile-tab-content profile-tab-comments hidden">
+      <p class="meta" style="padding:24px 16px;text-align:center">Comments coming soon.</p>
     </div>`;
 
+  // Tab switching
+  content.querySelectorAll(".profile-tab").forEach(tab => {
+    tab.addEventListener("click", () => {
+      content.querySelectorAll(".profile-tab").forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      const isPosts = tab.dataset.tab === "posts";
+      content.querySelector(".profile-tab-posts").classList.toggle("hidden", !isPosts);
+      content.querySelector(".profile-tab-comments").classList.toggle("hidden", isPosts);
+    });
+  });
+
   modal.classList.remove("hidden");
+  setTimeout(() => {
+    const closeBtn = document.getElementById("close-profile-modal");
+    if (closeBtn) closeBtn.focus();
+  }, 50);
 }
 
 function closeAgentProfileModal() {
   APP_STATE.viewingAgentId = null;
   const modal = document.getElementById("profile-modal");
   if (modal) modal.classList.add("hidden");
+  if (APP_STATE.modalLastFocusedEl) {
+    APP_STATE.modalLastFocusedEl.focus();
+    APP_STATE.modalLastFocusedEl = null;
+  }
 }
 
 // ============================================================
@@ -1908,6 +2256,19 @@ function render() {
   }
 
   if (APP_STATE.activeCommentPostId) renderCommentSheet();
+
+  // Keep web sidebar in sync
+  const shell = document.querySelector(".app-shell");
+  if (shell && shell.dataset.view === "web") {
+    const actEl = document.getElementById("sidebar-activity");
+    if (actEl) {
+      const recent = APP_STATE.feed.slice(0, 5);
+      actEl.innerHTML = `<h3 class="sidebar-heading">Recent Posts</h3>` +
+        (recent.length
+          ? recent.map(p => `<div class="sidebar-post">@${esc(p.author)}: ${esc((p.caption || "").slice(0, 60))}</div>`).join("")
+          : `<div class="sidebar-post" style="color:var(--muted)">No posts yet.</div>`);
+    }
+  }
 }
 
 // ============================================================
@@ -1963,9 +2324,15 @@ function closeGearPanel() {
 function openConnectSheet() {
   const sheet = document.getElementById("connect-sheet");
   if (!sheet) return;
-  // Show current endpoint
   const endpointEl = document.getElementById("connect-endpoint-url");
   if (endpointEl) endpointEl.textContent = window.location.origin;
+  // Reset to step 1
+  const step1 = document.getElementById("connect-step-1");
+  const step2 = document.getElementById("connect-step-2");
+  if (step1) step1.classList.remove("hidden");
+  if (step2) step2.classList.add("hidden");
+  if (ELS.agentName) ELS.agentName.value = "";
+  if (ELS.agentPersonality) ELS.agentPersonality.value = "";
   sheet.classList.remove("hidden");
 }
 
@@ -1981,6 +2348,17 @@ document.getElementById("gear-btn").addEventListener("click", openGearPanel);
 document.getElementById("close-gear").addEventListener("click", closeGearPanel);
 document.getElementById("close-connect").addEventListener("click", closeConnectSheet);
 document.getElementById("connect-backdrop").addEventListener("click", closeConnectSheet);
+document.querySelector(".connect-card").addEventListener("click", (e) => e.stopPropagation());
+
+const connectRegisterAnotherBtn = document.getElementById("connect-register-another");
+if (connectRegisterAnotherBtn) {
+  connectRegisterAnotherBtn.addEventListener("click", () => {
+    const step1 = document.getElementById("connect-step-1");
+    const step2 = document.getElementById("connect-step-2");
+    if (step1) step1.classList.remove("hidden");
+    if (step2) step2.classList.add("hidden");
+  });
+}
 
 ELS.speed.addEventListener("input", (event) => {
   APP_STATE.tickMs = Number(event.target.value);
@@ -2030,9 +2408,19 @@ ELS.agentForm.addEventListener("submit", async (event) => {
   try {
     const data = await api("POST", "/api/register", { name, style, personality });
     const key = data.apiKey || "";
+    const claimUrl = data.claimUrl || "";
 
-    // Show the API key
-    if (ELS.registerResult) ELS.registerResult.classList.remove("hidden");
+    // Show step 2
+    const step1 = document.getElementById("connect-step-1");
+    const step2 = document.getElementById("connect-step-2");
+    if (step1) step1.classList.add("hidden");
+    if (step2) step2.classList.remove("hidden");
+
+    // Claim URL
+    if (ELS.registerClaimUrl) ELS.registerClaimUrl.textContent = claimUrl;
+    if (ELS.openClaimUrlLink) { ELS.openClaimUrlLink.href = claimUrl; }
+
+    // API key
     if (ELS.registerApiKey) ELS.registerApiKey.textContent = key;
     if (ELS.curlExamples) {
       const origin = window.location.origin;
@@ -2056,6 +2444,7 @@ ELS.agentForm.addEventListener("submit", async (event) => {
     ELS.agentName.value = "";
     ELS.agentPersonality.value = "";
     addActivity(`New agent registered: ${name} (${style}).`, "system");
+    showToast("Agent registered!", "success");
   } catch (e) {
     alert(e.message || "Registration failed");
   } finally {
@@ -2063,12 +2452,26 @@ ELS.agentForm.addEventListener("submit", async (event) => {
   }
 });
 
+// Copy claim URL button
+if (ELS.copyClaimUrlBtn) {
+  ELS.copyClaimUrlBtn.addEventListener("click", () => {
+    const url = ELS.registerClaimUrl ? ELS.registerClaimUrl.textContent : "";
+    if (!url) return;
+    navigator.clipboard.writeText(url).then(() => {
+      showToast("Claim URL copied!", "info");
+      ELS.copyClaimUrlBtn.textContent = "Copied!";
+      setTimeout(() => { ELS.copyClaimUrlBtn.textContent = "Copy"; }, 2000);
+    }).catch(() => prompt("Copy this URL:", url));
+  });
+}
+
 // Copy API key button
 if (ELS.copyApiKeyBtn) {
   ELS.copyApiKeyBtn.addEventListener("click", () => {
     const key = ELS.registerApiKey ? ELS.registerApiKey.textContent : "";
     if (!key) return;
     navigator.clipboard.writeText(key).then(() => {
+      showToast("API key copied!", "info");
       ELS.copyApiKeyBtn.textContent = "Copied!";
       setTimeout(() => { ELS.copyApiKeyBtn.textContent = "Copy"; }, 2000);
     }).catch(() => {
@@ -2218,7 +2621,15 @@ document.getElementById("insta-feed").addEventListener("click", (event) => {
       // Use first sim agent key as viewer proxy (or no-op if no keys)
       const firstKey = [...APP_STATE.simAgentKeys.values()][0];
       if (firstKey) {
-        api("POST", `/api/posts/${postId}/like`, null, firstKey).catch(() => {});
+        api("POST", `/api/posts/${postId}/like`, null, firstKey).then(() => {
+          showToast("Liked ❤", "success");
+        }).catch(() => {
+          post.likes -= 1;
+          likeBtn.classList.remove("liked");
+          renderMobileFeed();
+        });
+      } else {
+        showToast("Liked ❤", "success");
       }
     }
     return;
@@ -2233,6 +2644,36 @@ document.getElementById("insta-feed").addEventListener("click", (event) => {
   const viewCommentsBtn = event.target.closest(".view-comments-btn");
   if (viewCommentsBtn) {
     openCommentSheet(viewCommentsBtn.dataset.postId);
+    return;
+  }
+
+  const shareBtn = event.target.closest(".share-btn");
+  if (shareBtn) {
+    const url = `${window.location.origin}`;
+    const caption = shareBtn.dataset.caption || "";
+    const truncatedCaption = caption.slice(0, 80) + (caption.length > 80 ? '…' : '');
+    const text = `${shareBtn.dataset.author}: ${truncatedCaption}`;
+    if (navigator.share) {
+      navigator.share({ title: "Gentigram", text, url }).catch(() => {});
+    } else {
+      navigator.clipboard.writeText(`${text} — ${url}`).then(() => {
+        showToast("Copied to clipboard!", "info");
+      }).catch(() => {});
+    }
+    return;
+  }
+
+  const bookmarkBtn = event.target.closest(".bookmark-btn");
+  if (bookmarkBtn) {
+    const postId = bookmarkBtn.dataset.postId;
+    if (APP_STATE.bookmarks.has(postId)) {
+      APP_STATE.bookmarks.delete(postId);
+      showToast("Bookmark removed", "default");
+    } else {
+      APP_STATE.bookmarks.add(postId);
+      showToast("Bookmarked!", "success");
+    }
+    bookmarkBtn.classList.toggle("bookmarked", APP_STATE.bookmarks.has(postId));
     return;
   }
 
@@ -2259,9 +2700,14 @@ document.getElementById("insta-feed").addEventListener("touchend", (event) => {
       heart.className = "heart-bubble";
       heart.textContent = "❤";
       heart.style.fontSize = "3rem";
-      heart.style.top = "50%";
-      heart.style.right = "50%";
-      heart.style.transform = "translate(50%, -50%)";
+      heart.style.position = "absolute";
+      const rect = media.getBoundingClientRect();
+      const touch = event.changedTouches[0];
+      const x = touch ? touch.clientX - rect.left : rect.width / 2;
+      const y = touch ? touch.clientY - rect.top : rect.height / 2;
+      heart.style.left = `${x}px`;
+      heart.style.top = `${y}px`;
+      heart.style.transform = "translate(-50%, -50%)";
       media.style.position = "relative";
       media.appendChild(heart);
       setTimeout(() => heart.remove(), 1000);
@@ -2360,12 +2806,31 @@ document.getElementById("profile-page-content").addEventListener("click", (event
 // ============================================================
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
+    const connectSheet = document.getElementById("connect-sheet");
+    if (connectSheet && !connectSheet.classList.contains("hidden")) {
+      connectSheet.classList.add("hidden");
+      return;
+    }
+    const profileModal = document.getElementById("profile-modal");
+    if (profileModal && !profileModal.classList.contains("hidden")) {
+      profileModal.classList.add("hidden");
+      if (APP_STATE.modalLastFocusedEl) { APP_STATE.modalLastFocusedEl.focus(); APP_STATE.modalLastFocusedEl = null; }
+      return;
+    }
+    const commentSheet = document.getElementById("comment-sheet");
+    if (commentSheet && !commentSheet.classList.contains("hidden")) {
+      APP_STATE.activeCommentPostId = null;
+      commentSheet.classList.add("hidden");
+      if (APP_STATE.commentSheetLastFocusedEl) { APP_STATE.commentSheetLastFocusedEl.focus(); APP_STATE.commentSheetLastFocusedEl = null; }
+      return;
+    }
+    const gearPanel = document.getElementById("gear-panel");
+    if (gearPanel && !gearPanel.classList.contains("hidden")) {
+      gearPanel.classList.add("hidden");
+      return;
+    }
     closePostModal();
-    closeCommentSheet();
     closeStoryViewer();
-    closeAgentProfileModal();
-    closeGearPanel();
-    closeConnectSheet();
   }
   if (!ELS.postModal.classList.contains("hidden") && event.key === "Tab") {
     const focusables = [ELS.refreshModalImageBtn, ELS.closeModal].filter(Boolean);
@@ -2392,6 +2857,19 @@ window.addEventListener("unhandledrejection", (event) => {
   reportRuntimeError(reason, "client");
 });
 
+// Feed sort tabs
+const feedSortTabs = document.getElementById("feed-sort-tabs");
+if (feedSortTabs) {
+  feedSortTabs.addEventListener("click", (e) => {
+    const tab = e.target.closest(".sort-tab");
+    if (!tab) return;
+    APP_STATE.feedSort = tab.dataset.sort;
+    feedSortTabs.querySelectorAll(".sort-tab").forEach(t => t.classList.remove("active"));
+    tab.classList.add("active");
+    renderMobileFeed();
+  });
+}
+
 // ============================================================
 // INIT
 // ============================================================
@@ -2401,6 +2879,9 @@ async function init() {
 
   // Load sim agent keys (needed before runTick so agents can call API)
   await loadSimAgentKeys();
+
+  // Show skeleton while loading
+  renderFeedSkeleton(4);
 
   // Fetch initial data from server
   await Promise.all([fetchAgents(), fetchFeed(), fetchStories()]);
