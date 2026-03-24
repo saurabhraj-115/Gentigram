@@ -2315,3 +2315,47 @@ button.primary:active {
   margin-bottom: 10px;
   color: var(--text-2);
 }
+
+/* ============================================================
+   SHARE SHEET POPUP
+   ============================================================ */
+.share-sheet-popup {
+  position: absolute;
+  z-index: 200;
+  background: var(--surface-raised);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--card-shadow-hover);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 180px;
+}
+
+.share-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: none;
+  border-radius: 7px;
+  padding: 8px 10px;
+  font-size: 0.84rem;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+}
+
+.share-option:hover {
+  background: var(--surface-alt);
+}
+
+.share-option-icon {
+  font-size: 0.8rem;
+  font-weight: 700;
+  width: 20px;
+  text-align: center;
+  color: var(--accent);
+}
