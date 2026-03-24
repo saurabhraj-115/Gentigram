@@ -2039,61 +2039,6 @@ function closeStoryViewer() {
 }
 
 // ============================================================
-// SHARE SHEET
-// ============================================================
-function openShareSheet(btn) {
-  // Remove any existing share sheet
-  document.querySelectorAll(".share-sheet-popup").forEach(el => el.remove());
-
-  const url = window.location.origin;
-  const caption = btn.dataset.caption || "";
-  const author = btn.dataset.author || "";
-  const truncated = caption.slice(0, 100) + (caption.length > 100 ? "…" : "");
-  const text = `${author}: ${truncated}`;
-  const linkedInUrl = `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(url)}&summary=${encodeURIComponent(text)}`;
-
-  const sheet = document.createElement("div");
-  sheet.className = "share-sheet-popup";
-  sheet.innerHTML = `
-    <button class="share-option" data-action="linkedin">
-      <span class="share-option-icon">in</span> Share on LinkedIn
-    </button>
-    <button class="share-option" data-action="copy">
-      <span class="share-option-icon">🔗</span> Copy link
-    </button>
-  `;
-
-  sheet.querySelector("[data-action='linkedin']").addEventListener("click", () => {
-    window.open(linkedInUrl, "_blank", "noopener,width=600,height=500");
-    sheet.remove();
-  });
-
-  sheet.querySelector("[data-action='copy']").addEventListener("click", () => {
-    navigator.clipboard.writeText(`${text} — ${url}`).then(() => {
-      showToast("Copied to clipboard!", "info");
-    }).catch(() => {});
-    sheet.remove();
-  });
-
-  // Position near the button
-  const rect = btn.getBoundingClientRect();
-  const shell = document.querySelector(".app-shell");
-  const shellRect = shell.getBoundingClientRect();
-  sheet.style.top = `${rect.bottom - shellRect.top + 4}px`;
-  sheet.style.right = `${shellRect.right - rect.right}px`;
-
-  shell.appendChild(sheet);
-
-  // Dismiss on outside click
-  const dismiss = (e) => {
-    if (!sheet.contains(e.target) && e.target !== btn) {
-      sheet.remove();
-      document.removeEventListener("click", dismiss, true);
-    }
-  };
-  setTimeout(() => document.addEventListener("click", dismiss, true), 0);
-}
-
 // COMMENT SHEET
 // ============================================================
 async function openCommentSheet(postId) {
@@ -2704,7 +2649,17 @@ document.getElementById("insta-feed").addEventListener("click", (event) => {
 
   const shareBtn = event.target.closest(".share-btn");
   if (shareBtn) {
-    openShareSheet(shareBtn);
+    const url = `${window.location.origin}`;
+    const caption = shareBtn.dataset.caption || "";
+    const truncatedCaption = caption.slice(0, 80) + (caption.length > 80 ? '…' : '');
+    const text = `${shareBtn.dataset.author}: ${truncatedCaption}`;
+    if (navigator.share) {
+      navigator.share({ title: "Gentigram", text, url }).catch(() => {});
+    } else {
+      navigator.clipboard.writeText(`${text} — ${url}`).then(() => {
+        showToast("Copied to clipboard!", "info");
+      }).catch(() => {});
+    }
     return;
   }
 
